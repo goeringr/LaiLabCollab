@@ -1,0 +1,108 @@
+---
+title: "HuExpression in mmNeruonDiff"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(biomaRt)
+library(tximport)
+library(DESeq2)
+library(cowplot)
+library(ggpubr)
+```
+
+```{r, }
+mart <- useMart("ENSEMBL_MART_ENSEMBL",
+                dataset = "mmusculus_gene_ensembl",
+                host='www.ensembl.org')
+
+
+t2g <- getBM(attributes = c('ensembl_transcript_id',
+                            'ensembl_gene_id',
+                            'external_gene_name',
+                            'refseq_mrna'), mart = mart)
+
+t2g <- dplyr::rename(t2g, "target_id" = ensembl_transcript_id, "ext_gene" = external_gene_name)
+
+ens2gene <- t2g[,c(2,3)]
+colnames(ens2gene)[2] <- 'Gene'
+ens2gene <- unique(ens2gene)
+tx2gene <- t2g[,c(1,2)]
+colnames(tx2gene) <- c('TXNAME', 'GENEID')
+
+
+##create TXI with salmon alignments
+
+files_f <- list.files("quants/mmNeuronDiff/")
+files_f <- files_f %>% as_tibble() %>% filter(str_detect(value, ".quant.sf")) %>% pull()
+samples_f <- str_sub(files_f, 1, str_length(files_f)-9)
+
+salm_dirs_f <- sapply(samples_f, function(id) file.path(paste("quants/mmNeuronDiff/",id,".quant.sf",sep = "")))
+
+#txi <- tximport(salm_dirs_f, 
+#                type = 'salmon', 
+#                tx2gene = tx2gene,
+#                dropInfReps = TRUE, 
+#                countsFromAbundance = 'lengthScaledTPM')
+
+#tpms <- data.frame(txi$abundance) 
+#tpms <- tpms[apply(tpms, MARGIN = 1, function(x) any(x > 5)), ] 
+
+#write.table(tpms, file = "mmNeuronDiff_tpms.txt")
+tpms <- read.table(file = "mmNeuronDiff_tpms.txt")
+
+```
+
+
+```{r, }
+conditions <- c("DIV0", "DIV0", "DIV0", "DIV1", "DIV1", "DIV1", "DIV1", "DIV16", "DIV16", "DIV16", "DIV16", "DIV21", "DIV21", "DIV21", "DIV21", "DIV28", "DIV28", "DIV28", "DIV28", "DIV7", "DIV7", "DIV7", "DIV7", "DIVminus4", "DIVminus4", "DIVminus4", "DIVminus8", "DIVminus8", "DIVminus8", "DIVminus8")
+type <- c("paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end","paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end")
+
+colData <- data.frame("sample" = samples_f, "Conditions" = conditions, "Type" = type)
+rownames(colData) <- colData$sample
+
+#dds <- DESeqDataSetFromTximport(txi, colData = colData, design = ~Conditions)
+#dds <- dds[rowMins(counts(dds)) > 10, ]
+#dds <- DESeq(dds)
+#norm_counts <- counts(dds, normalized = TRUE)
+#norm_counts <- norm_counts[apply(norm_counts, MARGIN = 1, function(x) all(x > 100)), ]
+#write.table(norm_counts, file = "mmNeuronDiff_normcts.txt")
+norm_counts <- read.table(file = "mmNeuronDiff_normcts.txt")
+```
+
+```{r, }
+norm_counts %>% 
+  as_tibble(rownames = "ensembl_gene_id") %>% 
+  left_join(., as_tibble(ens2gene)) %>% 
+  dplyr::select(ensembl_gene_id, Gene, everything()) %>%
+  filter(grepl(pattern = "Elav", Gene)) %>% 
+  gather(-ensembl_gene_id, - Gene, key = sample, value = norm_counts) %>% 
+  separate(sample, into = c("Day", "rep")) %>% 
+  ggplot(aes(x = Day, y = log(norm_counts), col = Day, fill = Day)) + 
+  geom_violin() + 
+  geom_boxplot(col = "Black", position = position_dodge(width = 0.9), width = 0.25) + 
+  geom_point(col = "Black", position = position_jitterdodge()) + 
+  theme_cowplot() + 
+  facet_wrap(.~Gene, nrow = 3) +
+  guides(fill = FALSE, col = FALSE) + 
+  scale_x_discrete(limits = c("DIVminus8", "DIVminus4", "DIV0", "DIV1", "DIV7", "DIV16", "DIV21", "DIV28")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+norm_counts %>% 
+  as_tibble(rownames = "ensembl_gene_id") %>% 
+  left_join(., as_tibble(ens2gene)) %>% 
+  dplyr::select(ensembl_gene_id, Gene, everything()) %>%
+  filter(grepl(pattern = "Elav", Gene)) %>% 
+  gather(-ensembl_gene_id, - Gene, key = sample, value = norm_counts) %>% 
+  separate(sample, into = c("Day", "rep")) %>% 
+  ggpubr::ggline(x = "Day", y = "norm_counts", color = "Gene", add = "mean_se", size = 1.5, title = "Hu Expression across timepoints", xlab = "", ylab = "normalized counts") + 
+  scale_x_discrete(limits = c("DIVminus8", "DIVminus4", "DIV0", "DIV1", "DIV7", "DIV16", "DIV21", "DIV28")) +
+  scale_color_manual(values = c("#fc9867", "#a9dc76", "#78dce8")) +
+  theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1))
+
+
+
+```

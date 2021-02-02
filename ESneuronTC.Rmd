@@ -1,0 +1,1224 @@
+---
+title: "Identifying Neurally Restricted Long Isoforms"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(cowplot)
+library(ggpubr)
+library(AnnotationDbi)
+library(UpSetR)
+
+`%out%` <- Negate(`%in%`)
+```
+
+```{r, venn fx, echo = FALSE}
+library(eulerr)
+`%notin%` <- Negate(`%in%`)
+fit <- function(l1,l2,l3, n1, n2, n3) {
+  abc = length(Reduce(intersect, list(l1, l2, l3)))
+  ab = sum(l1[l1 %in% l2] %notin% Reduce(intersect, list(l1, l2, l3)))
+  ac = sum(l1[l1 %in% l3] %notin% Reduce(intersect, list(l1, l2, l3)))
+  bc = sum(l2[l2 %in% l3] %notin% Reduce(intersect, list(l1, l2, l3)))
+  
+  a = length(l1)-abc-ab-ac
+  b = length(l2)-abc-ab-bc
+  c = length(l3)-abc-bc-ac
+  f <- euler(c("A"=a, "B"=b, "C"=c, "A&B"=ab, "A&C"=ac, "B&C"=bc, "A&B&C"=abc))
+  f$labels <- c(n1, n2, n3)
+  return(f)
+}
+
+atleast2of3  <- function(l1,l2,l3) {
+  abc = Reduce(intersect, list(l1, l2, l3))
+  ab = l1[l1 %in% l2][l1[l1 %in% l2] %notin% Reduce(intersect, list(l1, l2, l3))]
+  ac = l1[l1 %in% l3][l1[l1 %in% l3] %notin% Reduce(intersect, list(l1, l2, l3))]
+  bc = l2[l2 %in% l3][l2[l2 %in% l3] %notin% Reduce(intersect, list(l1, l2, l3))]
+  
+  all <- c(abc,ab,ac,bc)
+  
+  return(all)
+}
+
+```
+
+### The goal of this document is to identify genes that preferentially utilize a longer isoforms (or more downstream APA) in brain tissues/cells
+
+We are utilizing 4 datasets, two human and two mouse.
+Two are tissue focused, analyzing the isoform usage in different tissues including brain.
+Here we can identify long isoforms that are heavily used in brain and possibly conserved between mouse and human.
+The other experiments are timecourses across neruonal differentiation from embryonic stem cells.
+We can identify genes that increase in their long isoform usage as they differentiate into neurons. Again we can identify conserved genes between mouse and human.
+
+To discover these long isoforms preferentially used in brain, I have utilized both value thresholding (biased) and two different clustering techniques (less biased).
+
+Initially, I required that genes be identified in 2 of 3 of these methods to be considered neuronally restricted (NR) for each dataset but this was too stringent of a definition.
+
+To capture more events for downstream analyses, I simply combined the gene lists identified via k-means and hierarchical clustering for each dataset.
+
+
+----------------
+
+## Mouse Tissue data Brain <--> (Small Intestine, Liver, Heart)
+
+This data is from "A Comprehensive Mouse Transcriptomic BodyMap across 17 Tissues by RNA-seq" By Li et al in 2017
+
+https://www.nature.com/articles/s41598-017-04520-z
+
+It has many tissues however, Brain was only compared to Small Intestine, Liver and Heart to mimic the available human tissue data.
+Samples were collected from four mice, 2 male and 2 female.
+
+Below I have averaged the psi values across mice for each gene in each tissue to identify isoforms preferentially used in Brain tissue.
+
+-----------
+
+### We will only consider genes with 2 poly A sites (1 long isoform and 1 short)
+
+```{r, mouse genes with 2 polya sites}
+# mouse gff we will eventually pull sequences from:
+polya_txdb <- loadDb("psidat/twoUTR_polya_mm_gff_txdb.sqlite")
+# 4,554 genes with only two isoforms (short and long)
+mm2UTRids <- names(genes(polya_txdb)) %>% unique()
+
+```
+
+### Reading in LABRAT outputs and tidying them
+
+With the following data, LABRAT was not ran with any replicates.
+Therefore pvalues and FDRs are not especially meaningful.
+These are not needed for identifying genes with brain tissue specific long isoforms.
+
+```{r, mmTissue psi dat, warning = FALSE}
+# just the psi values for each tissue
+mm_psis <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis", header = TRUE)) %>% 
+  dplyr::rename("Brain_F4b" = "Bain_F4b", "Brain_M2b" = "Bain_M2b") %>% # get rid of some typos I made
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% mm2UTRids) # get rid of genes with more than 2 isoforms
+
+mm_psis_tidy <- mm_psis %>% 
+  gather(-Gene, -genetype, key = temp, value = psi) %>% 
+  separate(temp, into = c("tissue", "mouse"), sep = "_")
+
+# delta psi values (delta psi = TissueX - Brain)
+# Male mouse 1
+SInt_M1 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_SInt_M1.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "SInt_M1", "Brain" = "Brain_M1a") %>% 
+  mutate(mouse = "M1", tissue = "SInt")
+Heart_M1 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Heart_M1.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Heart_M1", "Brain" = "Brain_M1a") %>% 
+  mutate(mouse = "M1", tissue = "Heart")
+Liver_M1a <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_M1.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Liver_M1a", "Brain" = "Brain_M1a") %>% 
+  mutate(mouse = "M1", tissue = "Liver") %>% 
+  dplyr::select(-Brain_M1b, -Liver_M1b)
+Liver_M1b <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_M1.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Liver_M1b", "Brain" = "Brain_M1b") %>% 
+  mutate(mouse = "M1", tissue = "Liver") %>% 
+  dplyr::select(-Brain_M1a, -Liver_M1a)
+
+# Male mouse 2
+SInt_M2 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_SInt_M2.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "SInt_M2", "Brain" = "Brain_M2a") %>% 
+  mutate(mouse = "M2", tissue = "SInt")
+Heart_M2 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Heart_M2.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Heart_M2", "Brain" = "Brain_M2a") %>% 
+  mutate(mouse = "M2", tissue = "Heart")
+Liver_M2a <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_M2.pval", header = TRUE)) %>%
+  dplyr::rename("Tissue_X" = "Liver_M2a", "Brain" = "Brain_M2a") %>%
+  mutate(mouse = "M2", tissue = "Liver") %>% 
+  dplyr::select(-Bain_M2b, -Liver_M2b)
+Liver_M2b <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_M2.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Liver_M2b", "Brain" = "Bain_M2b") %>% 
+  mutate(mouse = "M2", tissue = "Liver") %>% 
+  dplyr::select(-Brain_M2a, -Liver_M2a)
+
+# Female mouse 3
+SInt_F3 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_SInt_F3.pval", header = TRUE)) %>%
+  dplyr::rename("Tissue_X" = "SInt_F3", "Brain" = "Brain_F3a") %>% 
+  mutate(mouse = "F3", tissue = "SInt")
+Heart_F3 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Heart_F3.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Heart_F3", "Brain" = "Brain_F3a") %>% 
+  mutate(mouse = "F3", tissue = "Heart")
+Liver_F3a <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_F3.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Liver_F3a", "Brain" = "Brain_F3a") %>% 
+  mutate(mouse = "F3", tissue = "Liver") %>% 
+  dplyr::select(-Brain_F3b, -Liver_F3b)
+Liver_F3b <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_F3.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Liver_F3b", "Brain" = "Brain_F3b") %>% 
+  mutate(mouse = "F3", tissue = "Liver") %>% 
+  dplyr::select(-Brain_F3a, -Liver_F3a)
+
+# Female mouse 4
+SInt_F4 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_SInt_F4.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "SInt_F4", "Brain" = "Brain_F4a") %>% 
+  mutate(mouse = "F4", tissue = "SInt")
+Heart_F4 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Heart_F4.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Heart_F4", "Brain" = "Brain_F4a") %>%
+  mutate(mouse = "F4", tissue = "Heart")
+Liver_F4a <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_F4.pval", header = TRUE)) %>%
+  dplyr::rename("Tissue_X" = "Liver_F4a", "Brain" = "Brain_F4a") %>%
+  mutate(mouse = "F4", tissue = "Liver") %>% 
+  dplyr::select(-Bain_F4b, -Liver_F4b)
+Liver_F4b <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_F4.pval", header = TRUE)) %>%
+  dplyr::rename("Tissue_X" = "Liver_F4b", "Brain" = "Bain_F4b") %>% 
+  mutate(mouse = "F4", tissue = "Liver") %>% 
+  dplyr::select(-Brain_F4a, -Liver_F4a)
+
+# Collect delta psi (dpsis) for ease
+mm_dpsis <- bind_rows(SInt_M1, Heart_M1, Liver_M1a, Liver_M1b, SInt_M2, Heart_M2, Liver_M2a, Liver_M2b, SInt_F3, Heart_F3, Liver_F3a, Liver_F3b, SInt_F4, Heart_F4, Liver_F4a, Liver_F4b) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% mm2UTRids) # get rid of genes with more than 2 isoforms
+
+```
+
+### We can define genes with preferential long isoform usage in brain by defining psi cutoffs and thresholds
+
+```{r, define mouse genes by value, warning = FALSE}
+# Generally, what does this data look like? Globally, Brain has the highest psi value
+comps <- list(c("Brain", "Heart"), c("Brain", "Liver"), c("Brain", "SInt"))
+mm_psis_tidy %>% mutate(mouse = ifelse(mouse == "F4a" | mouse == "F4b", "F4", 
+                                       ifelse(mouse == "F3a"| mouse == "F3b", "F3", 
+                                              ifelse(mouse == "M1a" | mouse == "M1b", "M1", 
+                                                     ifelse(mouse == "M2a" | mouse == "M2b", "M2", mouse))))) %>% 
+  ggplot(aes(x = tissue, y = psi, fill = tissue)) + 
+  geom_point(aes(alpha = 0.1, col = mouse), position = "jitter") + 
+  geom_violin() + geom_boxplot(width = 0.1) +
+  theme_cowplot() +
+  guides(fill = FALSE, alpha = FALSE) +
+  stat_compare_means(comparisons = comps, method = "wilcox") +
+  labs(x = "", title = "Mouse Tissue Psi Data")
+
+# 146 Genes with higher psi in brain than all other tissues (where is it expressed)
+NR_mm_genes1 <- mm_psis_tidy %>% 
+  group_by(Gene, tissue) %>% 
+  summarize(mean_psi = mean(psi, na.rm = TRUE)) %>% # calc mean_psi for each gene in each tissue
+  spread(key = tissue, value = mean_psi) %>% 
+  filter(Brain > 0.25, # longer isoform must be used in brain
+         any(is.na(Heart) == FALSE, is.na(Liver) == FALSE, is.na(SInt) == FALSE)) %>% # must be expressed in at least 1 other tissue
+  mutate(Heart = Brain - Heart, Liver = Brain - Liver, SInt = Brain - SInt) %>% # calc dpsis (Brain - TissueX)
+  filter(all((Heart > 0.2 | is.na(Heart) == TRUE), (Liver > 0.2 | is.na(Liver) == TRUE), (SInt > 0.2 | is.na(SInt) == TRUE))) %>% # dpsi must be greater than 0.2 in all tisues where a gene is expressed
+  pull(Gene)
+
+# 29 genes have high psi (>0.75) in some non brain reps
+rem_high  <- mm_psis %>% 
+  filter(Gene %in% NR_mm_genes1) %>% 
+  dplyr::select(-contains("Brain"), -genetype) %>%
+  gather(-Gene, key = sample, value =  psi) %>%
+  filter(psi > 0.75) %>%
+  pull(Gene) %>%
+  unique()
+
+# 19 genes have low psi( <0.25) in some brain reps
+rem_low <- mm_psis %>%
+  filter(Gene %in% NR_mm_genes1) %>% 
+  dplyr::select(Gene, contains("Brain"), -genetype) %>% 
+  gather(-Gene, key = sample, value =  psi) %>%
+  filter(psi < 0.25) %>% 
+  pull(Gene) %>% 
+  unique() 
+
+# 11 genes with positive dpsi( > 0 ) in some reps
+rem_dpsi <- mm_psis_tidy %>% 
+  spread(tissue, psi) %>%
+  gather(Heart, Liver, SInt, key = Tissue_X, value = psi) %>% 
+  filter(Brain > 0) %>% 
+  mutate(dpsi = Brain - psi) %>% 
+  filter(dpsi < 0, Gene %in% NR_mm_genes1) %>% 
+  pull(Gene) %>%
+  unique()
+
+#final 98 Nuclear restricted (NR) genes after removing the inconsistent genes defined above
+NR_mm_genes <- NR_mm_genes1[NR_mm_genes1 %out% c(rem_high, rem_low, rem_dpsi)]
+
+# plots of NR genes in each tissue
+m <- mm_dpsis %>% 
+  gather(Brain, Tissue_X, key = key, value = psi)  %>% 
+  group_by(Gene, tissue, key) %>% 
+  summarize(mean_psi = mean(psi, na.rm = TRUE)) %>% 
+  mutate(NR = ifelse(Gene %in% NR_mm_genes, T, F))
+
+m %>% ggplot(aes(x = key, mean_psi, fill = tissue)) + 
+  geom_violin() + geom_boxplot(width = 0.1) + 
+  geom_point(aes(col = NR, alpha = NR, size = NR)) + 
+  theme_cowplot() + 
+  scale_color_manual(values = c("Black", "Red")) +
+  scale_alpha_manual(values = c(0.1, 1)) + 
+  facet_grid(.~tissue) +
+  geom_line(data = subset(m, NR == TRUE), aes(group = Gene)) +
+  guides(fill = FALSE) +
+  labs(x = "")
+
+```
+
+### We can also define genes with preferential long isoform usage in brain by identifying clusters of genes with shared behaviors
+
+```{r, define mouse genes by trend, warning = FALSE}
+# filter out genes with low std
+filtData <- mm_psis_tidy %>% 
+  group_by(Gene, tissue) %>% 
+  summarise(mean_psi = mean(psi, na.rm = TRUE)) %>% 
+  spread(tissue, mean_psi) %>% 
+  ungroup() %>% 
+  mutate(std = matrixStats::rowSds(as.matrix(.[2:5]))) %>% 
+  filter(std != 0) %>% 
+  dplyr::select(-std)
+
+# log transform data
+clustData <- filtData %>% 
+  select_if(is.numeric) %>%
+  mutate_all(funs(log10(1 + .))) %>%
+  as.matrix()
+
+rownames(clustData) <- filtData$Gene
+
+# scale data
+s_clustData <- t(scale(t(clustData))) 
+
+# kmeans cluster 3 seems cool...
+set.seed(1)
+kclust <- pheatmap::pheatmap(mat = s_clustData,
+                cluster_cols = F,
+                scale = "row",
+                kmeans_k = 6,
+                color = viridis::viridis(20))
+# 405 genes in k3
+K3_mm_genes <- data.frame(Cluster=kclust$kmeans$cluster,
+                          Gene=names(kclust$kmeans$cluster)) %>% 
+  as_tibble() %>% 
+  filter(Cluster == 3) %>% 
+  pull(Gene) %>% 
+  as.character()
+
+# Gene cluster 5 is the one
+ph <- pheatmap::pheatmap(mat = s_clustData,
+                 cluster_cols = FALSE,
+                 show_rownames = FALSE,
+                 scale = "row",
+                 color = viridis::viridis(20))
+                  
+pheatmap::pheatmap(mat = s_clustData,
+                 cluster_cols = FALSE,
+                 show_rownames = FALSE,
+                 scale = "row",
+                 color = viridis::viridis(20),
+                 cutree_rows = 13,
+                 annotation_row = data.frame(cluster = as.factor(cutree(ph$tree_row, 13))),
+                 annotation_colors = list(cluster = c("1" = "grey", "2" = "grey", "3" = "grey", "4" = "grey", "5" = "red", "6" = "grey", "7" = "grey", "8" = "grey", "9" = "grey", "10" = "grey", "11" = "grey", "12" = "grey", "13" = "grey")))
+                 
+#220 genes in cluster 5
+cluster5_mm_genes <- cutree(ph$tree_row, 13) %>% as_tibble(rownames = "Gene") %>% filter(value == 5) %>% pull(Gene)
+
+```
+
+### What genes are shared between each discovery method?
+
+```{r, mouse gene comparisons,  warning = FALSE}
+# what genes are shared?
+v <- fit(NR_mm_genes, K3_mm_genes, cluster5_mm_genes, "value", "kmeans", "cluster")
+plot(v, quantities = TRUE, labels = v$labels, main = "mouse NR genes as defined by different methods")
+
+#213 genes discovered in 2/3 methods as being NR
+#mmTissue_genes <- atleast2of3(NR_mm_genes, K3_mm_genes, cluster5_mm_genes)
+
+#420 genes less stringent in both k and hierarchical clustering
+mmTissue_genes <- unique(c(K3_mm_genes, cluster5_mm_genes))
+
+# NR genes in each tissue 
+z <- mm_psis %>% 
+  gather(-Gene, - genetype, key = sample, value = psi) %>% 
+  separate(sample, into = c("tissue", "mouse")) %>% 
+  group_by(Gene, tissue) %>% 
+  summarize(mean_psi = mean(psi, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  spread(tissue, mean_psi) %>% 
+  gather(SInt, Heart, Liver, key = tissue, value = Tissue_X) %>% 
+  mutate(NR = ifelse(Gene %in% mmTissue_genes,T,F)) %>%
+  gather(-Gene, -NR, -tissue, key= key, value = mean_psi)
+
+z %>% ggplot(aes(x = key, mean_psi, fill = tissue)) + 
+  geom_violin() + geom_boxplot(width = 0.1) + 
+  geom_point(aes(col = NR, alpha = NR, size = NR)) +
+  theme_cowplot() + 
+  scale_color_manual(values = c("Black", "Red")) + 
+  scale_alpha_manual(values = c(0.1,1)) +
+  facet_grid(.~tissue) + 
+  guides(fill = FALSE) +
+  geom_line(data = subset(z, NR == TRUE), aes(group = Gene)) +
+  labs(x = "")
+
+```
+
+----------------
+
+## Human Tissue data Brain <--> (Gut, Liver, Heart)
+
+This data is from "Identification of Tissue-Specific Protein-Coding and Noncoding Transcripts across 14 Human Tissues Using RNA-seq" By Zhu et al in 2016
+
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4916594/
+
+It has many tissues however, Brain tissue was only collected from one donor.
+Gut, Heart and Liver were also collected from that same donor so I moved forward with those three tissues.
+Samples were sequenced at two different sites City of Hope (COH) and Beijing Genomic Institute (BGI)
+
+Below I have averaged the psi values across samples for each gene in each tissue to identify isoforms preferentially used in Brain tissue.
+
+----------------
+
+### We will only consider genes with two isoforms (long and short)
+
+```{r, human genes with 2 polya sites}
+# human gff we will eventually pull sequences from:
+polya_txdb <- loadDb("psidat/twoUTR_polya_gff_txdb.sqlite")
+# 5,367 genes with two isoforms (short and long)
+hs2UTRids <- names(genes(polya_txdb)) %>% unique()
+
+```
+
+### Reading in LABRAT outputs and tidying them
+
+With the following data, LABRAT was not ran with any replicates.
+Therefore pvalues and FDRs are not especially meaningful.
+These are not needed for identifying genes with preferentially neuronal long isoforms.
+
+```{r, hsTissue dpsi dat, warning = FALSE}
+# just the psi values for each tissue
+hs_psis <- as_tibble(read.table("psidat/hsTissue/LABRAT.psis", header = TRUE)) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in Gene ID
+  filter(Gene %in% hs2UTRids) # get rid of genes with more than 2 isoforms
+
+hs_psis_tidy <- hs_psis %>% 
+  gather(-Gene, -genetype, key = temp, value = psi) %>% 
+  separate(temp, into = c("rep", "tissue"), sep = "_") %>% 
+  unique()
+
+# delta psi values (delta psi = TissueX - Brain)
+# BGI samples
+BGI_Gut <- as_tibble(read.table("psidat/hsTissue/LABRAT.psis.BGI_BrainvGut.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "BGI_Gut", "Brain" = "BGI_Brain") %>% 
+  mutate(rep = "BGI", tissue = "Gut")
+BGI_Heart <- as_tibble(read.table("psidat/hsTissue/LABRAT.psis.BGI_BrainvHeart.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "BGI_Heart", "Brain" = "BGI_Brain") %>%
+  mutate(rep = "BGI", tissue = "Heart")
+BGI_Liver <- as_tibble(read.table("psidat/hsTissue/LABRAT.psis.BGI_BrainvLiver.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "BGI_Liver", "Brain" = "BGI_Brain") %>%
+  mutate(rep = "BGI", tissue = "Liver")
+
+# COH samples
+COH_Gut <- as_tibble(read.table("psidat/hsTissue/LABRAT.psis.COH_BrainvGut.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "COH_Gut", "Brain" = "COH_Brain") %>% 
+  mutate(rep = "COH", tissue = "Gut")
+COH_Heart <- as_tibble(read.table("psidat/hsTissue/LABRAT.psis.COH_BrainvHeart.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "COH_Heart", "Brain" = "COH_Brain") %>%
+  mutate(rep = "COH", tissue = "Heart")
+COH_Liver <- as_tibble(read.table("psidat/hsTissue/LABRAT.psis.COH_BrainvLiver.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "COH_Liver", "Brain" = "COH_Brain") %>%
+  mutate(rep = "COH", tissue = "Liver")
+
+# Collect delta psi (dpsis) for ease
+hs_dpsis <- bind_rows(BGI_Gut, BGI_Heart, BGI_Liver, COH_Gut, COH_Heart, COH_Liver) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% hs2UTRids) # get rid of genes with more than 2 isoforms
+
+```
+
+### We can define genes with preferential long isoform usage in brain by defining psi cutoffs and thresholds
+
+```{r, looky, warning = FALSE}
+# Generally, what does this data look like? Heart seems very different between the two sequencing sites
+# not as clear as the mouse tissue data
+comps <- list(c("Brain", "Gut"), c("Brain", "Heart"), c("Brain", "Liver"))
+hs_psis_tidy %>% ggplot(aes(x = tissue, y = psi, fill = tissue)) + 
+  geom_point(aes(col = rep, alpha = 0.1), position = "jitter") + 
+  geom_violin() + geom_boxplot(width = 0.1) + 
+  theme_cowplot() + 
+  stat_compare_means(comparisons = comps, method = "wilcox") +
+  guides(alpha = FALSE, fill = FALSE) +
+  labs(x = "", y = "Human Tissue Psi Data")
+
+#117 Genes with higher psi in brain than all other tissues (where is it expressed)
+NR_hs_genes1 <- hs_psis_tidy %>% 
+  group_by(Gene, tissue) %>% 
+  summarize(mean_psi = mean(psi, na.rm = TRUE)) %>% #calc mean_psi for each gene in each tissue
+  spread(key = tissue, value = mean_psi) %>% 
+  filter(Brain > 0.25, #longer isoform must be used in brain
+         any(is.na(Heart) == FALSE, is.na(Liver) == FALSE, is.na(Gut) == FALSE)) %>% #must be expressed in at least 1 other tissue
+  mutate(Heart = Brain - Heart, Liver = Brain - Liver, Gut = Brain - Gut) %>% #calc dpsis
+  filter(all((Heart > 0.2 | is.na(Heart) == TRUE), (Liver > 0.2 | is.na(Liver) == TRUE), (Gut > 0.2 | is.na(Gut) == Gut))) %>% #dpsi must be greater than 0.2 in all tisues where a gene is expressed
+  pull(Gene)
+
+#52 genes have high psi (>0.75) in some non brain reps
+rem_high  <- hs_psis %>% 
+  filter(Gene %in% NR_hs_genes1) %>% 
+  dplyr::select(-contains("Brain"), -genetype) %>% 
+  gather(-Gene, key = sample, value =  psi) %>% 
+  filter(psi > 0.75) %>% 
+  pull(Gene) %>% 
+  unique()
+
+#3 genes have low psi( <0.25) in some brain reps
+rem_low <- hs_psis %>%
+  filter(Gene %in% NR_hs_genes1) %>% 
+  dplyr::select(Gene, contains("Brain"), -genetype) %>% 
+  gather(-Gene, key = sample, value = psi) %>% 
+  filter(psi < 0.25) %>% pull(Gene) %>% 
+  unique() 
+
+#7 genes with dpsi( > 0) in some reps
+rem_dpsi <- hs_psis_tidy %>% 
+  spread(tissue, psi) %>% 
+  gather(Heart, Liver, Gut, key = Tissue_X, value = psi) %>%
+  filter(Brain > 0) %>%
+  mutate(dpsi = Brain - psi) %>%
+  filter(dpsi < 0) %>% 
+  filter(Gene %in% NR_hs_genes1) %>% 
+  pull(Gene) %>% 
+  unique()
+
+#final 62 Nuclear restricted (NR) genes after removing the inconsistent genes defined above
+NR_hs_genes <- NR_hs_genes1[NR_hs_genes1 %out% c(rem_high, rem_low, rem_dpsi)]
+
+# plots of NR genes in each tissue
+m <- hs_dpsis %>% 
+  gather(Brain, Tissue_X, key = key, value = psi)  %>%
+  group_by(Gene, tissue, key) %>% 
+  summarize(mean_psi = mean(psi, na.rm = TRUE)) %>% 
+  mutate(NR = ifelse(Gene %in% NR_hs_genes, T, F))
+
+m %>% ggplot(aes(x = key, mean_psi, fill = tissue)) + 
+  geom_violin() + geom_boxplot(width = 0.1) + 
+  geom_point(aes(col = NR, alpha = NR, size = NR)) +
+  theme_cowplot() + 
+  scale_color_manual(values = c("Black", "Red")) + 
+  scale_alpha_manual(values = c(0.1,1)) +
+  facet_grid(.~tissue) + 
+  guides(fill = FALSE) +
+  geom_line(data = subset(m, NR == TRUE), aes(group = Gene))
+
+```
+
+### We can also define genes with preferential long isoform usage in brain by identifying clusters of genes with shared behaviors
+
+```{r, hs heatmaps, warning = FALSE}
+# filter out genes with low std
+filtData <- hs_psis_tidy %>% 
+  group_by(Gene, tissue) %>% 
+  summarise(mean_psi = mean(psi, na.rm = TRUE)) %>%
+  spread(tissue, mean_psi) %>% 
+  ungroup() %>%  
+  mutate(std = matrixStats::rowSds(as.matrix(.[2:5])))  %>%
+  filter(std != 0) %>% 
+  dplyr::select(-std)
+
+# log transform data
+clustData <- filtData %>% 
+  select_if(is.numeric) %>%
+  mutate_all(funs(log10(1 + .))) %>%
+  as.matrix()
+
+rownames(clustData) <- filtData$Gene
+
+# scale data
+s_clustData <- t(scale(t(clustData))) 
+
+#kmeans cluster 4 seems cool...
+set.seed(2)
+kclust <- pheatmap::pheatmap(mat = s_clustData,
+                cluster_cols = F,
+                scale = "row",
+                kmeans_k = 4,
+                color = viridis::viridis(20))
+
+K4_hs_genes <- data.frame(Cluster=kclust$kmeans$cluster,
+                          Gene=names(kclust$kmeans$cluster)) %>% 
+  as_tibble() %>% 
+  filter(Cluster == 4) %>% 
+  pull(Gene) %>% 
+  as.character()
+
+##gene cluster 3 and 9 is the one
+ph <- pheatmap::pheatmap(mat = s_clustData,
+                 cluster_cols = FALSE,
+                 show_rownames = FALSE,
+                 scale = "row",
+                 color = viridis::viridis(20))
+                 
+pheatmap::pheatmap(mat = s_clustData,
+                 cluster_cols = FALSE,
+                 show_rownames = FALSE,
+                 scale = "row",
+                 color = viridis::viridis(20),
+                 cutree_rows = 14,
+                 annotation_row = data.frame(cluster = as.factor(cutree(ph$tree_row, 14))),
+                 annotation_colors = list(cluster = c("1" = "grey", "2" = "grey", "3" = "red", "4" = "grey", "5" = "grey", "6" = "grey", "7" = "grey", "8" = "grey", "9" = "red", "10" = "grey", "11" = "grey", "12" = "grey", "13" = "grey", "14" = "grey")))
+  
+#252 genes in cluster 3 and 9
+cluster3_hs_genes <- cutree(ph$tree_row, 14) %>% as_tibble(rownames = "Gene") %>% filter(value == 3 | value == 9) %>% pull(Gene)
+
+```
+
+### What genes are shared between each discovery method?
+
+```{r, warning = FALSE}
+#what genes are shared?
+v <- fit(NR_hs_genes, K4_hs_genes, cluster3_hs_genes, "value", "kmeans", "cluster")
+plot(v, quantities = TRUE, labels = v$labels, main = "human NR genes as defined by different methods")
+
+#212 genes discovered in 2/3 methods as being NR
+#hsTissue_genes <- atleast2of3(NR_hs_genes, K4_hs_genes, cluster3_hs_genes)
+
+#460 less stringent in both K and hierarchical clustering
+hsTissue_genes <- unique(c(K4_hs_genes, cluster3_hs_genes))
+
+
+z <- hs_psis %>% 
+  gather(-Gene, - genetype, key = sample, value = psi) %>% 
+  separate(sample, into = c("sample", "tissue")) %>% 
+  group_by(Gene, tissue) %>% 
+  summarize(mean_psi = mean(psi, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  spread(tissue,mean_psi) %>% 
+  gather(Gut,Heart,Liver, key = tissue, value = Tissue_X) %>%
+  mutate(NR = ifelse(Gene %in% hsTissue_genes,T,F)) %>%
+  gather(-Gene, -NR, -tissue, key= key, value = mean_psi)
+
+z %>% ggplot(aes(x = key, mean_psi, fill = tissue)) + 
+  geom_violin() + geom_boxplot(width = 0.1) + 
+  geom_point(aes(col = NR, alpha = NR, size = NR)) +
+  theme_cowplot() + 
+  scale_color_manual(values = c("Black", "Red")) + 
+  scale_alpha_manual(values = c(0.1,1)) +
+  facet_grid(.~tissue) + 
+  guides(fill = FALSE) +
+  geom_line(data = subset(z, NR == TRUE), aes(group = Gene)) +
+  labs(x = "")
+
+```
+
+----------------
+
+## Mouse Embryonic Stem Cell --> Neruonal Time course
+
+This data is from "Longitudinal RNA sequencing of the deep transcriptome during neurogenesis of cortical glutamatergic neurons from murine ESCs" by Hubbard et al in 2013
+
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3829120/
+
+mouse embryonic stem cells were differentiated into neurons 
+RNA sequencing occured in triplicate across 8 timepoints
+Everything is compared to the starting point (mESC) DIVminus8.
+
+Here we will identify genes that change their isoform usage to a longer one as they differentiate into neurons.
+
+----------------
+
+### Reading in LABRAT outputs and tidying them
+Here, we have 3 replicates for each timepoint so LABRAT calculated pvalues and FDRs are useful
+
+```{r, read in mm TC dat, warning = FALSE}
+# just the psi values for each timepoint
+dm4 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIVminus4.pval", header = TRUE))
+d0 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIV0.pval", header = TRUE))
+d1 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIV1.pval", header = TRUE))
+d7 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIV7.pval", header = TRUE))
+d16 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIV16.pval", header = TRUE))
+d21 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIV21.pval", header = TRUE))
+d28 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIV28.pval", header = TRUE))
+
+TC_mm_psis <- bind_rows(dm4, d0, d1, d7, d16, d21, d28) %>% 
+  dplyr::select(-deltapsi, -pval, -FDR) %>% # get rid of pval data for now
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>%  # get rid of decimals in gene IDs
+  filter(Gene %in% mm2UTRids) %>%  # get rid of genes with more than 2 isoforms
+  unique()
+  
+TC_mm_psis_tidy <- TC_mm_psis %>% 
+  gather(-Gene, -genetype, key = sample, value = psi) %>% 
+  separate(sample, into = c("day", "rep"))
+
+# delta psi values (delta psi = TimepointX - DIVminus8)
+ddm4 <- dm4 %>% dplyr::select(-contains("Rep")) %>% mutate(sample = "DIVminus4")
+dd0 <- d0 %>% dplyr::select(-contains("Rep")) %>% mutate(sample = "DIV0")
+dd1 <- d1 %>% dplyr::select(-contains("Rep")) %>% mutate(sample = "DIV1")
+dd7 <- d7 %>% dplyr::select(-contains("Rep")) %>% mutate(sample = "DIV7")
+dd16 <- d16 %>% dplyr::select(-contains("Rep")) %>% mutate(sample = "DIV16")
+dd21 <- d21 %>% dplyr::select(-contains("Rep")) %>% mutate(sample = "DIV21")
+dd28 <- d28 %>% dplyr::select(-contains("Rep")) %>% mutate(sample = "DIV28")
+
+TC_mm_dpsis <- bind_rows(ddm4, dd0, dd1, dd7, dd16, dd21, dd28) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% mm2UTRids) # get rid of genes with more than 2 isoforms
+```
+
+### We can define genes with preferential long isoform usage in brain by defining psi cutoffs and thresholds
+
+```{r, mm TC psideas, warning = FALSE, , fig.width = 25, fig.height = 10}
+# psi values increase over time
+TC_mm_psis_tidy %>% 
+  ggplot(aes(x = factor(day), y = psi, fill = day)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.1) + 
+  scale_x_discrete(limits = c("DIVminus8", "DIVminus4", "DIV0", "DIV1", "DIV7", "DIV16", "DIV21", "DIV28")) +
+  theme_cowplot() + 
+  guides(fill = FALSE) + 
+  theme(text = element_text(size=25), axis.text = element_text(size = 15)) +
+  labs(x = "") 
+
+# which changes first? TUTRs or ALEs?
+TC_mm_psis_tidy %>% 
+  filter(genetype != "mixed") %>% 
+  ggplot(aes(x = factor(day), y = psi, fill = day)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.1) + 
+  scale_x_discrete(limits = c("DIVminus8", "DIVminus4", "DIV0", "DIV1", "DIV7", "DIV16", "DIV21", "DIV28")) +
+  theme_cowplot() + 
+  guides(fill = FALSE) + 
+  theme(text = element_text(size=25), axis.text = element_text(size = 15)) +
+  labs(x = "") +
+  facet_wrap(.~genetype, nrow = 2)
+
+TC_mm_psis_tidy %>% 
+  filter(genetype != "mixed") %>% 
+  ggpubr::ggline(x = "day", y = "psi", color = "genetype", add = "mean_se", size = 1.5, title = "Changes in psi of gene types across timepoints") + 
+  stat_compare_means(aes(group = genetype), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = 0.6) +
+  scale_x_discrete(limits = c("DIVminus8", "DIVminus4", "DIV0", "DIV1", "DIV7", "DIV16", "DIV21", "DIV28"))
+
+# 103 sig and pos dpsi in all comparisons
+NR_mm_TC_genes <- TC_mm_dpsis %>% 
+  filter(deltapsi > 0, FDR < 0.05) %>% 
+  group_by(Gene) %>% 
+  summarize(n=n()) %>% 
+  filter(n >= 7) %>% 
+  pull(Gene) %>% 
+  unique()
+
+# 1094 pos and sig in at least one comparison
+# TC_mm_dpsis %>% filter(deltapsi > 0, FDR < 0.05) %>% group_by(Gene) %>% summarize(n=n())
+
+# plots of NR genes in each tissue
+p <- TC_mm_psis_tidy %>% group_by(Gene,day) %>% summarize(mean_psi = mean(psi, na.rm = TRUE)) %>% ungroup() %>% spread(day, mean_psi) %>% gather(-Gene, -DIVminus8, key = TP, value = TP_X) %>% mutate(NR = ifelse(Gene %in% NR_mm_TC_genes,T,F)) %>% gather(DIVminus8, TP_X, key = key, value = mean_psi)
+
+p %>% ggplot(aes(x = key, mean_psi, fill = TP)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.1) + 
+  geom_point(aes(col = NR, alpha = NR, size = NR)) + 
+  theme_cowplot() + 
+  scale_color_manual(values = c("Black", "Red")) +
+  scale_alpha_manual(values = c(0.1, 1)) + 
+  facet_grid(.~factor(TP, levels = c("DIVminus4", "DIV0", "DIV1", "DIV7", "DIV16", "DIV21", "DIV28"))) +
+  geom_line(data = subset(p, NR == TRUE), aes(group = Gene)) +
+  guides(fill = FALSE) +
+  theme(text = element_text(size=20), axis.text = element_text(size = 15)) +
+  labs(x = "")
+
+```
+
+### We can also define genes with preferential long isoform usage in brain by identifying clusters of genes with shared behaviors
+
+```{r, mm pheatmap tc, warning = FALSE}
+# filter out genes with low std
+filtData <- TC_mm_psis_tidy %>% 
+  dplyr::select(-genetype) %>% 
+  group_by(Gene, day) %>% 
+  summarize(mean_psi = mean(psi, na.rm = TRUE)) %>% 
+  spread(day, mean_psi) %>% 
+  ungroup() %>% 
+  dplyr::select(Gene, DIVminus8, DIVminus4, DIV0, DIV1, DIV7, DIV16, DIV21, DIV28) %>%
+  mutate(std = matrixStats::rowSds(as.matrix(.[2:9]))) %>% 
+  filter(std != 0) %>% dplyr::select(-std)
+
+# log transform data
+clustData <- filtData %>% 
+  select_if(is.numeric) %>%
+  mutate_all(funs(log10(1 + .))) %>%
+  as.matrix()
+
+rownames(clustData) <- filtData$Gene
+
+# scale data
+s_clustData <- t(scale(t(clustData))) 
+
+#cluster 3 is cool
+set.seed(1)
+kclust <- pheatmap::pheatmap(mat = s_clustData, 
+                              kmeans_k = 3, 
+                              cluster_cols = FALSE,
+                              scale = "row", 
+                              color = viridis::viridis(20))
+
+# 968 genes in K3
+K3_mm_TC_genes <- data.frame(Cluster=kclust$kmeans$cluster,
+                          Gene=names(kclust$kmeans$cluster)) %>% 
+  as_tibble() %>% 
+  filter(Cluster == 3) %>% 
+  pull(Gene) %>% 
+  as.character()
+
+#Gene cluster 3 is the one
+ph <- pheatmap::pheatmap(mat = s_clustData,
+                 cluster_cols = FALSE,
+                 show_rownames = FALSE,
+                 scale = "row",
+                 color = viridis::viridis(20))
+                  
+pheatmap::pheatmap(mat = s_clustData,
+                 cluster_cols = FALSE,
+                 show_rownames = FALSE,
+                 scale = "row",
+                 color = viridis::viridis(20),
+                 cutree_rows = 4,
+                 annotation_row = data.frame(cluster = as.factor(cutree(ph$tree_row, 4))),
+                 annotation_colors = list(cluster = c("1" = "grey", "2" = "grey", "3" = "red", "4" = "grey")))
+                 
+#751 genes in cluster 3
+cluster3_mm_TC_genes <- cutree(ph$tree_row, 4) %>% as_tibble(rownames = "Gene") %>% filter(value == 3) %>% pull(Gene)
+
+```
+
+### What genes are shared between each discovery method?
+
+```{r, warning = FALSE}
+#what genes are shared?
+v <- fit(NR_mm_TC_genes, K3_mm_TC_genes, cluster3_mm_TC_genes, "value", "kmeans", "cluster")
+plot(v, quantities = TRUE, labels = v$labels, main = "mouse TC NR genes as defined by different methods", text = element_text(size = 25))
+```
+
+```{r, warning = FALSE, fig.width = 25, fig.height = 10}
+# 722 genes discovered 2/3 methods
+#mmTC_genes <- atleast2of3(NR_mm_TC_genes, K3_mm_TC_genes, cluster3_mm_TC_genes)
+
+# 1022 less stringent in both K and hierarchical clustering
+mmTC_genes <- unique(c(K3_mm_TC_genes, cluster3_mm_TC_genes))
+
+t <- TC_mm_psis_tidy %>% 
+  group_by(Gene, day) %>%
+  summarize(mean_psi = mean(psi, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(NR = ifelse(Gene %in% mmTC_genes, T, F)) %>% 
+  spread(day, mean_psi) %>%
+  gather(DIVminus4, DIV0, DIV1, DIV7, DIV16, DIV21, DIV28, key = key, value = TP_X) %>%
+  gather(DIVminus8, TP_X, key = day, value = mean_psi)
+
+t %>% ggplot(aes(x = day, mean_psi, fill = key)) +
+  geom_violin() + 
+  geom_boxplot(width = 0.1) + 
+  geom_point(aes(col = NR, alpha = NR, size = NR)) +
+  theme_cowplot() + 
+  scale_color_manual(values = c("Black", "Red")) +
+  scale_alpha_manual(values = c(0.1,1)) +
+  geom_line(data = subset(t, NR == TRUE), aes(group = Gene)) + 
+  guides(fill = FALSE) + 
+  theme(text = element_text(size=20), axis.text = element_text(size = 15)) +
+  facet_grid(.~factor(key, levels = c("DIVminus4", "DIV0", "DIV1", "DIV7", "DIV16", "DIV21", "DIV28")))
+```
+
+----------------
+
+## Human Embryonic Stem Cell --> Neruonal Time course
+
+Data is from "Transcriptome analysis reveals determinant stages controlling human embryonic stem cell commitment to neuronal cells" by Li et al in 2017
+
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5712601/
+
+human embryonic stem cells were differentiated into neurons 
+RNA sequencing occured across 12 timepoints
+nothing was sequenced with replicates
+
+Here we will identify genes that change their isoform usage to a longer one as they differentiate into neurons.
+
+
+----------------
+
+### Reading in LABRAT outputs and tidying them
+Here we had 12 timepoints with no replicates (0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, and 22d)
+I created pseudo triplicates by grouping this timecourse into threes. ESC (0, 2, 4), early (6, 8, 10), mid (12, 14, 16), and late (18, 20, 22)
+
+```{r, ESn hs dpsi dat, warning = FALSE}
+# just the psi values for each gene at each timepoint
+TC_hs_psis <- as_tibble(read.table("psidat/hsNeurondiff/LABRAT.psis", header = TRUE)) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% hs2UTRids) # get rid of genes with more than 2 isoforms
+
+TC_hs_psis_tidy <- TC_hs_psis %>% 
+  gather(-Gene, -genetype, key = Day, value = psi)
+
+# delta psi values (delta psi = DayX - Day0)
+E <- as_tibble(read.table("psidat/hsNeurondiff/LABRAT.psis.early.pval", header = TRUE)) %>% mutate(time = "early")
+M <- as_tibble(read.table("psidat/hsNeurondiff/LABRAT.psis.mid.pval", header = TRUE)) %>% mutate(time = "mid")
+L <- as_tibble(read.table("psidat/hsNeurondiff/LABRAT.psis.late.pval", header = TRUE)) %>% mutate(time = "late")
+
+
+TC_hs_dpsis <- bind_rows(E, M, L) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% hs2UTRids) %>% 
+  dplyr::select(-contains("Day")) %>% # get rid of genes with more than 2 isoforms
+  unique()
+
+```
+
+### We can define genes with preferential long isoform usage in brain by defining psi cutoffs and thresholds
+
+```{r, psideas, warning = FALSE}
+#psi values increase....kinda over time
+TC_hs_psis_tidy %>% ggplot(aes(x = factor(Day), y = psi, fill = Day)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.1) + 
+  scale_x_discrete(limits = c("Day00", "Day02", "Day04", "Day06", "Day08", "Day10", "Day12", "Day14", "Day16", "Day18", "Day20", "Day22")) + 
+  theme_cowplot() + 
+  guides(fill = FALSE) + 
+  labs(x = "") 
+
+# which changes first? TUTRs or ALEs?
+TC_hs_psis_tidy %>% 
+  filter(genetype != "mixed") %>% 
+  ggplot(aes(x = factor(Day), y = psi, fill = Day)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.1) + 
+  scale_x_discrete(limits = c("Day00", "Day02", "Day04", "Day06", "Day08", "Day10", "Day12", "Day14", "Day16", "Day18", "Day20", "Day22")) + 
+  theme_cowplot() + 
+  guides(fill = FALSE) + 
+  labs(x = "") +
+  facet_wrap(.~genetype, nrow = 2)
+
+TC_hs_psis_tidy %>% 
+  filter(genetype != "mixed") %>% 
+  ggpubr::ggline(x = "Day", y = "psi", color = "genetype", add = "mean_se", size = 1.5, title = "Changes in psi of gene types across timepoints") + 
+  stat_compare_means(aes(group = genetype), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = 0.6) +
+  scale_x_discrete(limits = c("Day00", "Day02", "Day04", "Day06", "Day10", "Day12", "Day14", "Day16", "Day18", "Day20", "Day22"))
+
+TC_hs_psis_tidy %>% mutate(time = ifelse(Day == "Day00" | Day == "Day02" | Day == "Day04", "ESC", 
+                                         ifelse(Day == "Day06" | Day == "Day08" | Day == "Day10", "early", 
+                                                ifelse(Day == "Day12" | Day == "Day14" | Day == "Day16", "mid", "late")))) %>%
+  ggplot(aes(x = factor(time), y = psi, fill = time)) + 
+  geom_violin() +
+  geom_boxplot(width = 0.1) +
+  scale_x_discrete(limits = c("ESC", "early", "mid", "late")) + 
+  theme_cowplot() + 
+  guides(fill = FALSE) + 
+  labs(x = "") 
+
+
+# 9 genes sig and pos in all cases
+#NR_hs_TC_genes <- TC_hs_dpsis %>% 
+#filter(deltapsi > 0, FDR < 0.05) %>% 
+   # group_by(Gene) %>% 
+ # summarize(n=n()) %>% 
+ # filter(n == 3)
+
+# 265 pos and sig in at least one comparison
+NR_hs_TC_genes <- TC_hs_dpsis %>%
+  filter(deltapsi > 0, FDR < 0.05) %>%
+  group_by(Gene) %>%
+  summarize(n=n()) %>% 
+  pull(Gene) %>% 
+  unique()
+
+# How well do those 265 genes overlap?
+late_hs_NR_genes <- TC_hs_dpsis %>% filter(time == "late", FDR < 0.05, deltapsi > 0) %>% pull(Gene) %>% unique() # 80 genes
+mid_hs_NR_genes <- TC_hs_dpsis %>% filter(time == "mid", FDR < 0.05, deltapsi > 0) %>% pull(Gene) %>% unique() #26 genes
+early_hs_NR_genes <- TC_hs_dpsis %>% filter(time == "early", FDR < 0.05, deltapsi > 0) %>% pull(Gene) %>% unique() #123 genes
+
+v <- fit(early_hs_NR_genes, mid_hs_NR_genes, late_hs_NR_genes, "Early", "Mid", "Late")
+plot(v, quantities = TRUE, labels = v$labels)
+
+# plots of NR genes in each timepoint
+p <- TC_hs_psis_tidy %>% 
+  mutate(time = ifelse(Day == "Day00" | Day == "Day02" | Day == "Day04", "ESC",
+                       ifelse(Day == "Day06" | Day == "Day08" | Day == "Day10", "early", 
+                              ifelse(Day == "Day12" | Day == "Day14" | Day == "Day16", "mid", "late")))) %>%
+  group_by(Gene, time) %>% 
+  summarize(mean_psi = mean(psi, na.rm = TRUE)) %>%
+  ungroup() %>% 
+  spread(time, mean_psi) %>% 
+  gather(-Gene, -ESC, key = TP, value = TP_X) %>% 
+  mutate(NR = ifelse(Gene %in% NR_hs_TC_genes,T,F)) %>% 
+  gather(ESC, TP_X, key = key, value = mean_psi)
+
+p %>% ggplot(aes(x = key, mean_psi, fill = TP)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.1) + 
+  geom_point(aes(col = NR, alpha = NR, size = NR)) + 
+  theme_cowplot() + 
+  scale_color_manual(values = c("Black", "Red")) +
+  scale_alpha_manual(values = c(0.1, 1)) + 
+  facet_grid(.~factor(TP, levels = c("early", "mid", "late"))) +
+  geom_line(data = subset(p, NR == TRUE), aes(group = Gene)) +
+  guides(fill = FALSE) +
+  labs(x = "")
+
+```
+
+### We can also define genes with preferential long isoform usage in brain by identifying clusters of genes with shared behaviors
+
+```{r, hs TC trends, warning = FALSE}
+# filter out genes with low std
+filtData <- TC_hs_psis_tidy %>%
+  mutate(time = ifelse(Day == "Day00" | Day == "Day02" | Day == "Day04", "ESC", 
+                       ifelse(Day == "Day06" | Day == "Day08" | Day == "Day10", "early", 
+                              ifelse(Day == "Day12" | Day == "Day14" | Day == "Day16", "mid", "late")))) %>% 
+  group_by(Gene, time) %>% 
+  summarize(mean_psi = mean(psi, na.rm = TRUE)) %>% 
+  spread(time,mean_psi) %>% 
+  dplyr::select(Gene, ESC, early, mid, late) %>%
+  ungroup() %>%
+  mutate(std = matrixStats::rowSds(as.matrix(.[2:5]))) %>%
+  filter(std != 0) %>%
+  dplyr::select(-std)
+
+# log transform data
+clustData <- filtData %>% 
+  select_if(is.numeric) %>%
+  mutate_all(funs(log10(1 + .))) %>%
+  as.matrix()
+
+rownames(clustData) <- filtData$Gene
+
+# scale data
+s_clustData <- t(scale(t(clustData))) 
+
+
+#cluster 1
+set.seed(3)
+kclust <- pheatmap::pheatmap(mat = s_clustData, 
+                              kmeans_k = 5, 
+                              cluster_cols = FALSE, 
+                              scale = "row", 
+                              color = viridis::viridis(20))
+
+# 597 genes in K1
+K1_hs_TC_genes <- data.frame(Cluster=kclust$kmeans$cluster,
+                          Gene=names(kclust$kmeans$cluster)) %>% 
+  as_tibble() %>% 
+  filter(Cluster == 1) %>% 
+  pull(Gene) %>% 
+  as.character()
+
+#Gene cluster 3 is the one
+set.seed(1)
+ph <- pheatmap::pheatmap(mat = s_clustData,
+                 cluster_cols = FALSE,
+                 show_rownames = FALSE,
+                 scale = "row",
+                 color = viridis::viridis(20))
+                  
+pheatmap::pheatmap(mat = s_clustData,
+                 cluster_cols = FALSE,
+                 show_rownames = FALSE,
+                 scale = "row",
+                 color = viridis::viridis(20),
+                 cutree_rows = 3,
+                 annotation_row = data.frame(cluster = as.factor(cutree(ph$tree_row, 3))),
+                 annotation_colors = list(cluster = c("1" = "red", "2" = "grey", "3" = "grey")))
+                 
+#885 genes in cluster 1
+cluster1_hs_TC_genes <- cutree(ph$tree_row, 3) %>% as_tibble(rownames = "Gene") %>% filter(value == 1) %>% pull(Gene)
+
+```
+
+```{r, warning = FALSE}
+#what genes are shared?
+v <- fit(NR_hs_TC_genes, K1_hs_TC_genes, cluster1_hs_TC_genes, "value", "kmeans", "cluster")
+plot(v, quantities = TRUE, labels = v$labels, main = "human TC NR genes as defined by different methods")
+
+# 527 genes discovered in 2 of 3 methods
+#hsTC_genes <- atleast2of3(NR_hs_TC_genes, K1_hs_TC_genes, cluster1_hs_TC_genes)
+
+# 1022 less stringent in K and hierarchical clustering
+hsTC_genes <- unique(c(K1_hs_TC_genes, cluster1_hs_TC_genes))
+
+t <- TC_hs_psis_tidy %>% 
+  mutate(time = ifelse(Day == "Day00" | Day == "Day02" | Day == "Day04", "ESC", 
+                       ifelse(Day == "Day06" | Day == "Day08" | Day == "Day10", "early", 
+                              ifelse(Day == "Day12" | Day == "Day14" | Day == "Day16", "mid", "late")))) %>%
+  group_by(Gene, time) %>% 
+  summarize(mean_psi = mean(psi, na.rm = TRUE)) %>%
+  mutate(NR = ifelse(Gene %in% hsTC_genes, T, F)) %>% 
+  spread(time, mean_psi) %>% 
+  gather(early, late, mid, key = key, value = time_X) %>% 
+  gather(ESC, time_X, key = time, value = mean_psi)
+
+t %>% ggplot(aes(x = time, mean_psi, fill = key)) +
+  geom_violin() +
+  geom_boxplot(width = 0.1) +
+  geom_point(aes(col = NR, alpha = NR, size = NR)) +
+  theme_cowplot() +
+  scale_color_manual(values = c("Black", "Red")) + 
+  scale_alpha_manual(values = c(0.1,1)) + 
+  guides(fill = FALSE) +
+  geom_line(data = subset(t, NR == TRUE), aes(group = Gene)) +
+  facet_grid(.~factor(key, levels = c("early", "mid", "late")))
+
+```
+
+```{r, figure out k NM code, echo = FALSE}
+wss <- function(knum, data2clust) {
+  ph <- pheatmap::pheatmap(mat = data2clust, kmeans_k = knum, scale = "none", cluster_cols = F, silent = T)
+  ph$kmeans$tot.withinss
+}
+
+k2test <- 2:20
+clustInfo <- data.frame(k=integer(), wss=double())
+set.seed(42)
+for (i in k2test) {
+  clustInfo[i,1] <- i
+  clustInfo[i,2] <- wss(knum = i, data2clust = s_clustData)
+}
+#clustInfo
+
+#plot(clustInfo$k, clustInfo$wss,
+#       type="b", pch = 19, frame = FALSE, 
+#       xlab="Number of clusters K",
+#       ylab="Total within-clusters sum of squares")
+
+```
+
+-----------
+
+### Now we can identify NR genes conserved between mouse and human
+
+---------
+
+```{r, all the genes compared}
+plot(euler(list("mouse tissue" = mmTissue_genes, "mouse diff" = mmTC_genes)), quantities = TRUE)
+
+plot(euler(list("human tissue" = hsTissue_genes, "human diff" = hsTC_genes)), quantities = TRUE)
+h2m <- as_tibble(readRDS("psidat/human2mousegeneid.txt"))
+
+# all genes represented as hs orthologs 
+mm2hsTissue_genes <- h2m %>% filter(mouse_gene %in% mmTissue_genes) %>% pull(ensembl_gene_id) %>% unique()
+mm2hsTC_genes <- h2m %>% filter(mouse_gene %in% mmTC_genes) %>% pull(ensembl_gene_id) %>% unique()
+
+upset_dat <-list(hsTissue = hsTissue_genes, mmTissue = mm2hsTissue_genes, hsDiff = hsTC_genes, mmDiff = mm2hsTC_genes)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+
+#150 genes are identified in at least one human and one mouse gene list
+
+```
+
+### genes lists for further sequence analysis
+We will create gene lists of interest including NR genes found in mouse, human and in both (conserved)
+We also need to define control gene lists that do not include the above genes yet are expressed in brain.
+
+```{r, gene lists}
+# 3499 genes expressed in either brain tissue or differentiated neurons
+mm_expressed <- unique(c(mm_psis_tidy %>% 
+                           filter(tissue == "Brain") %>% 
+                           na.omit() %>% 
+                           pull(Gene) %>% 
+                           unique(), TC_mm_psis_tidy %>% 
+                                     filter(day == "DIV28") %>%  
+                                     na.omit() %>% 
+                                     pull(Gene) %>% 
+                                     unique()))
+
+# 3996 genes expressed in either brain tissue or differentiated neurons
+hs_expressed <- unique(c(hs_psis_tidy %>% 
+                           filter(tissue == "Brain") %>%
+                           na.omit() %>%
+                           pull(Gene) %>%
+                           unique(), 
+                         TC_hs_psis_tidy %>% 
+                           mutate(time = ifelse(Day == "Day00" | Day == "Day02" | Day == "Day04", "ESC",
+                                                ifelse(Day == "Day06" | Day == "Day08" | Day == "Day10", "early", 
+                                                       ifelse(Day == "Day12" | Day == "Day14" | Day == "Day16", "mid", "late")))) %>% 
+                           filter(time == "late") %>% 
+                           na.omit() %>% 
+                           pull(Gene) %>% 
+                           unique()))
+
+# 6526 conserved expressed genes
+cs_expressed <- unique(c(h2m %>% 
+                           filter(mouse_gene %in% mm_expressed) %>% 
+                           pull(ensembl_gene_id) %>%
+                           unique(), 
+                         hs_expressed))
+
+# 293 mouse NR genes, 3206 ctrl genes
+#mm_NR_genes <- mmTissue_genes[mmTissue_genes %in% mmTC_genes]
+#mm_ctrl_genes <- mm_expressed[mm_expressed %out% mm_NR_genes]
+
+# 157 human NR genes, 3839 ctrl genes
+#hs_NR_genes <- hsTissue_genes[hsTissue_genes %in% hsTC_genes]
+#hs_ctrl_genes <- hs_expressed[hs_expressed %out% hs_NR_genes]
+
+# 1100 mouse NR genes, 2329 ctrl genes
+mm_NR_genes <- unique(c(K3_mm_genes, K3_mm_TC_genes))
+mm_ctrl_genes <- mm_expressed[mm_expressed %out% mm_NR_genes]
+
+# 943 human NR genes, 3053 ctrl genes
+hs_NR_genes <- unique(c(K1_hs_TC_genes, K4_hs_genes))
+hs_ctrl_genes <- hs_expressed[hs_expressed %out% hs_NR_genes]
+
+# 150 conserved NR genes, 6376 ctrl genes
+cs_NR_genes <- unique(c(mm2hsTC_genes[mm2hsTC_genes %in% hsTC_genes], 
+                        mm2hsTC_genes[mm2hsTC_genes %in% hsTissue_genes], 
+                        mm2hsTissue_genes[mm2hsTissue_genes %in% hsTC_genes],
+                        mm2hsTissue_genes[mm2hsTissue_genes %in% hsTissue_genes]))
+cs_ctrl_genes <- cs_expressed[cs_expressed %out% cs_NR_genes]
+
+saveRDS(mm_NR_genes, "psidat/mm_NR_genes.txt")
+saveRDS(mm_ctrl_genes, "psidat/mm_ctrl_genes.txt")
+saveRDS(hs_NR_genes, "psidat/hs_NR_genes.txt")
+saveRDS(hs_ctrl_genes, "psidat/hs_ctrl_genes.txt")
+saveRDS(cs_NR_genes, "psidat/cs_NR_genes.txt")
+saveRDS(cs_ctrl_genes, "psidat/cs_ctrl_genes.txt")
+
+##just tissue genes
+saveRDS(mmTissue_genes, "psidat/mmTissue_genes.txt")
+saveRDS(mm_expressed[mm_expressed %out% mmTissue_genes], "psidat/mmTissue_ctrl_genes")
+saveRDS(hsTissue_genes, "psidat/hsTissue_genes.txt")
+saveRDS(hs_expressed[hs_expressed %out% hsTissue_genes], "psidat/hsTissue_ctrl_genes")
+
+```
+
+### What are these genes?
+
+```{r, GO analysis}
+library(enrichR)
+library(biomaRt)
+
+mmMart <- useMart("ENSEMBL_MART_ENSEMBL",
+                 dataset = "mmusculus_gene_ensembl",
+                 host='www.ensembl.org')
+hsMart <- useMart("ENSEMBL_MART_ENSEMBL",
+                 dataset = "hsapiens_gene_ensembl",
+                 host='www.ensembl.org')
+
+dbs <- listEnrichrDbs()
+dbs <- c("GO_Molecular_Function_2018", "GO_Cellular_Component_2018", "GO_Biological_Process_2018" , "ChEA_2016" ,"KEGG_2019_Human")
+
+mm_gene_name <- getBM(attributes=c('ensembl_gene_id',
+                   'external_gene_name'),
+      filters = "ensembl_gene_id",
+      values = mm_NR_genes,
+      mart = mmMart) %>% pull(., external_gene_name)
+hs_gene_name <- getBM(attributes=c('ensembl_gene_id',
+                   'external_gene_name'),
+      filters = "ensembl_gene_id",
+      values = hs_NR_genes,
+      mart = hsMart) %>% pull(., external_gene_name)
+hs_cs_gene_name <- getBM(attributes=c('ensembl_gene_id',
+                   'external_gene_name'),
+      filters = "ensembl_gene_id",
+      values = cs_NR_genes,
+      mart = hsMart) %>% pull(., external_gene_name) 
+
+mm_genes <- enrichr(mm_gene_name, dbs)
+hs_genes <- enrichr(hs_gene_name, dbs)
+hs_cs_genes <- enrichr(hs_cs_gene_name, dbs)
+
+mm_genes[["GO_Biological_Process_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+mm_genes[["GO_Cellular_Component_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+mm_genes[["GO_Molecular_Function_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+
+hs_genes[["GO_Biological_Process_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+hs_genes[["GO_Cellular_Component_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+hs_genes[["GO_Molecular_Function_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+
+hs_cs_genes[["GO_Biological_Process_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+hs_cs_genes[["GO_Cellular_Component_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+hs_cs_genes[["GO_Molecular_Function_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+
+```
+
+
+

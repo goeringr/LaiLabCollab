@@ -1,0 +1,1022 @@
+---
+title: "Human NR Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(cowplot)
+library(ggpubr)
+library(AnnotationDbi)
+library(UpSetR)
+library(BSgenome.Hsapiens.NCBI.GRCh38)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(GenomicFeatures)
+library(RNAreachR)
+library(eulerr)
+
+`%out%` <- Negate(`%in%`)
+`%notin%` <- Negate(`%in%`)
+```
+
+```{r, }
+get_U <- function(DNAStringSet){
+  U <- data.frame(gene = names(DNAStringSet),
+                   U = Biostrings::letterFrequency(DNAStringSet, "T") / Biostrings::width(DNAStringSet)) %>%
+    dplyr::as_tibble() %>%
+    dplyr::rename(U = T)
+  return(U)
+}
+
+U_compare <- function(caseDNAStringSet, ctrlDNAStringSet){
+
+  if (any(names(caseDNAStringSet) %in% names(ctrlDNAStringSet))){
+    warning("some sequences in case set are also in the control set. This is not recommended.")
+  }
+
+  U_case <- Biostrings::letterFrequency(caseDNAStringSet, "T") / Biostrings::width(caseDNAStringSet)
+  U_ctrl <- Biostrings::letterFrequency(ctrlDNAStringSet, "T") / Biostrings::width(ctrlDNAStringSet)
+  wilcox.p <- wilcox.test(U_case, U_ctrl)$p.value
+  mean_case <- mean(U_case)
+  mean_ctrl <- mean(U_ctrl)
+  mean_FC <- mean_case/mean_ctrl
+  CliffDelta <- effsize::cliff.delta(U_case, U_ctrl)$estimate
+  lowerCD <- effsize::cliff.delta(U_case, U_ctrl)$conf.int[1]
+  upperCD <- effsize::cliff.delta(U_case, U_ctrl)$conf.int[2]
+
+  data.frame(wilcox.p, mean_case, mean_ctrl, mean_FC, CliffDelta, lowerCD, upperCD)
+}
+metagene_flank_nt <- function(DNAStringSet1, DNAStringSet2, Nt, grp1, grp2, title){
+  
+  bin10_NtContent <- function(DNAStringset, Nt, x){
+    y <- letterFrequencyInSlidingView(DNAStringset[[x]], 1, Nt)
+    
+    bin_size <- rep(length(y) %/% 11, 11)
+    bin_size <- bin_size + ifelse(1:11 <= length(y) %% 11, 1, 0)
+    
+    bins <- lapply(c(1:11), function(y) rep(y, bin_size[y])) %>% unlist
+    
+    z <- y %>%
+      as_tibble() %>%
+      dplyr::rename("nt_content" = 1) %>% 
+      mutate(bin = bins) %>%
+      group_by(bin) %>%
+      summarize(content = mean(nt_content, na.rm = TRUE), .groups = "drop")
+  
+    return(z)
+    
+  }
+  
+  m <- c(1:length(DNAStringSet1))
+  list1 <- lapply(m, function(m) bin10_NtContent(DNAStringSet1, Nt, m))
+  one <- bind_rows(list1, .id = "seq") %>% mutate(bin = as.character(bin), group = !!grp1)
+  
+  
+  n <- c(1:length(DNAStringSet2))
+  list2 <- lapply(n, function(n) bin10_NtContent(DNAStringSet2, Nt, n))
+  two <- bind_rows(list2, .id = "seq") %>% mutate(bin = as.character(bin), group = !!grp2)
+  
+
+  y_label <- rbind(one, two) %>% group_by(bin, group) %>% summarize(mean = mean(content), .groups = "drop") %>% pull(mean) %>% max()
+  
+  p <- rbind(one, two) %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = title, xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.02) + scale_x_discrete(labels = c("-100", "-80", "-60", "-40", "-20", "0", "20", "40", "60", "80", "100"))
+  
+  return(p)
+}
+
+metagene_flank_motif <- function(PWM_list, caseDNAStringSet, ctrlDNAStringSet, title){
+
+   case_list <- lapply(PWM_list, function(x) lapply(caseDNAStringSet, function(y) matchPWM(x,y) %>% data.frame(start = start(.), end = end(.))))
+  case_df <- case_list %>% 
+    unlist(recursive = FALSE) %>% 
+    bind_rows(., .id = "key") %>% 
+    as_tibble() %>% 
+    dplyr::rename("match" = 2) %>% 
+    separate(key, into = c("motif", "RBP", "gene", "UTR"), extra = "merge") %>%
+    mutate(pos = round(((end - start)*0.5) + start), 
+           bin = ifelse(pos > 0 & pos <= 19, "-100", 
+                        ifelse(pos > 19 & pos <= 38, "-80", 
+                               ifelse(pos > 38 & pos <= 56, "-60",
+                                      ifelse(pos > 56 & pos <= 74, "-40",
+                                             ifelse(pos > 74 & pos <= 92, "-20", 
+                                                    ifelse(pos > 92 & pos <= 110, "0", 
+                                                           ifelse(pos > 110 & pos <= 128, "20",
+                                                                  ifelse(pos > 128 & pos <= 146, "40", 
+                                                                         ifelse(pos > 146 & pos <= 164, "60", 
+                                                                                ifelse(pos > 164 & pos <= 182, "80",
+                                                                                       ifelse(pos > 182 & pos <= 200, "100", "")))))))))))) %>%
+    group_by(bin, RBP, gene) %>% 
+    summarize(count = n()) %>% 
+    mutate(group = "NR")
+  
+   ctrl_list <- lapply(PWM_list, function(x) lapply(ctrlDNAStringSet, function(y) matchPWM(x,y) %>% data.frame(start = start(.), end = end(.))))
+  ctrl_df <- ctrl_list %>% 
+    unlist(recursive = FALSE) %>% 
+    bind_rows(., .id = "key") %>% 
+    as_tibble() %>% 
+    dplyr::rename("match" = 2) %>% 
+    separate(key, into = c("motif", "RBP", "gene", "UTR"), extra = "merge") %>%
+    mutate(pos = round(((end - start)*0.5) + start), 
+           bin = ifelse(pos > 0 & pos <= 19, "-100", 
+                        ifelse(pos > 19 & pos <= 38, "-80", 
+                               ifelse(pos > 38 & pos <= 56, "-60",
+                                      ifelse(pos > 56 & pos <= 74, "-40",
+                                             ifelse(pos > 74 & pos <= 92, "-20", 
+                                                    ifelse(pos > 92 & pos <= 110, "0", 
+                                                           ifelse(pos > 110 & pos <= 128, "20",
+                                                                  ifelse(pos > 128 & pos <= 146, "40", 
+                                                                         ifelse(pos > 146 & pos <= 164, "60", 
+                                                                                ifelse(pos > 164 & pos <= 182, "80",
+                                                                                       ifelse(pos > 182 & pos <= 200, "100", "")))))))))))) %>%
+    group_by(bin, RBP, gene) %>% 
+    summarize(count = n()) %>%
+    mutate(group = "ctrl")
+    
+  hit_df <- rbind(case_df, ctrl_df)  
+  #y_label <- hit_df %>% group_by(bin, group, RBP) %>% summarize(mean = mean(count), .groups = "drop") %>% pull(mean) %>% max()
+  
+    p <- hit_df %>% ggline(x = "bin", y = "count", color = "group", add = "mean_se", size = 1.5, title = title, facet.by = "RBP", scales = "free_y", xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y.npc = 0.07) + scale_x_discrete(labels = c("-100", "-80", "-60", "-40", "-20", "0", "20", "40", "60", "80", "100")) 
+ 
+  return(p)
+}
+
+```
+## Human Differentiation Timeline (ESC --> Neurons)
+
+This data is from "Dissecting transcriptomic signatures of neuronal differentiation and maturation using iPSCs" By Emily E. Burke in Nature Communications 2020
+
+https://www.nature.com/articles/s41467-019-14266-z
+
+It has many timepoints from several cell lines derived from a few donors
+
+
+-----------
+
+### We will only consider genes with 2 poly A sites (1 long isoform and 1 short)
+
+```{r, human genes with 2 polya sites}
+# human gff we will eventually pull sequences from:
+polya_txdb <- loadDb("psidat/twoUTR_polya_gff_txdb.sqlite")
+seqlevelsStyle(polya_txdb) <- "NCBI"
+# 4,554 genes with only two isoforms (short and long)
+hs2UTRids <- names(genes(polya_txdb)) %>% unique()
+genetypes <- read.table("psidat/human_genetype_table.txt", header = TRUE)
+
+```
+
+### Reading in LABRAT outputs and tidying them
+
+
+```{r, mmTissue psi dat, warning = FALSE}
+# just the psi values for each tissue
+psis <- as_tibble(read.table("psidat/Burke2020/psis2/LABRAT.psis", header = TRUE)) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% hs2UTRids) # get rid of genes with more than 2 isoforms (31% of genes are kept)
+
+###what are these 2 APA site genes??
+
+all <- as_tibble(read.table("psidat/Burke2020/psis2/LABRAT.psis", header = TRUE)) %>% 
+  dplyr::select(Gene, genetype) %>% 
+  unique() %>% 
+  group_by(genetype) %>% 
+  summarize(all = n())
+APA2 <- as_tibble(read.table("psidat/Burke2020/psis2/LABRAT.psis", header = TRUE)) %>% 
+  dplyr::select(Gene, genetype) %>%
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% 
+  filter(Gene %in% hs2UTRids) %>% 
+  unique() %>% 
+  group_by(genetype) %>% 
+  summarize(APA2 = n())
+APA_more <- as_tibble(read.table("psidat/Burke2020/psis2/LABRAT.psis", header = TRUE)) %>% 
+  dplyr::select(Gene, genetype) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% 
+  filter(Gene %notin% hs2UTRids) %>% 
+  unique() %>% 
+  group_by(genetype) %>% 
+  summarize(more_APA = n())
+
+left_join(all,APA_more) %>% left_join(., APA2) %>% 
+    mutate(all = round(all/sum(all)*100,1),
+           more_APA = round(more_APA/sum(more_APA)*100,1),
+           APA2 = round(APA2/sum(APA2)*100,1)) %>% 
+    gather(-genetype, key = group, value = Percent) %>% 
+    mutate(label = paste(genetype, "\n", as.character(Percent), "%", sep = ""),
+           group = ifelse(group == "all", "All Genes\nN=10731", ifelse(group == "APA2", "2 APA\nN=5367", "> 2 APA\nN=5356"))) %>% 
+    ggplot(aes(x = group, y = Percent, fill = genetype)) +
+    geom_bar(stat ="identity") +
+    theme_cowplot() +
+    labs(x = "", title = "Burke 2020 Human Genes with and without 2 APA sites") +
+    geom_text(size = 3, position = position_stack(vjust = 0.5), aes(label = label)) +
+    guides(fill = FALSE) +
+    scale_fill_manual(values = c("#fc9867", "#a9dc76", "#78dce8"))
+
+###
+
+psis_tidy <- psis %>% 
+  gather(-Gene, -genetype, key = temp, value = psi) %>% 
+  mutate(TP = ifelse(grepl(x = temp, "ACC_DORSAL_2"), "Day02",
+                     ifelse(grepl(x = temp, "ACC_DORSAL_6"), "Day06", 
+                            ifelse(grepl(x = temp, "ACC_DORSAL_9"), "Day09",
+                                   ifelse(grepl(x = temp, "NPC_15"), "Day15",
+                                          ifelse(grepl(x = temp, "ROSETTE_21"), "Day21",
+                                                 ifelse(grepl(x = temp, "ASTROS_49"), "Day49",
+                                                        ifelse(grepl(x = temp,"ASTROS_63"), "Day63",
+                                                               ifelse(grepl(x = temp, "ASTROS_77"), "Day77", "NEURONS")))))))))
+
+# delta psi values (delta psi = TimePointX - Day02)
+D06 <- tibble(read.table("psidat/Burke2020/psis2/LABRAT.psis.pval.Day06", header = TRUE)) %>% 
+  mutate(sample = "Day06") %>% dplyr::select(Gene, genetype, deltapsi, pval, FDR, sample)
+D09 <- tibble(read.table("psidat/Burke2020/psis2/LABRAT.psis.pval.Day09", header = TRUE)) %>% 
+  mutate(sample = "Day09") %>% dplyr::select(Gene, genetype, deltapsi, pval, FDR, sample)
+D15 <- tibble(read.table("psidat/Burke2020/psis2/LABRAT.psis.pval.Day15", header = TRUE)) %>% 
+  mutate(sample = "Day15") %>% dplyr::select(Gene, genetype, deltapsi, pval, FDR, sample)
+D21 <- tibble(read.table("psidat/Burke2020/psis2/LABRAT.psis.pval.Day21", header = TRUE)) %>% 
+  mutate(sample = "Day21") %>% dplyr::select(Gene, genetype, deltapsi, pval, FDR, sample)
+D49 <- tibble(read.table("psidat/Burke2020/psis2/LABRAT.psis.pval.Day49", header = TRUE)) %>% 
+  mutate(sample = "Day49") %>% dplyr::select(Gene, genetype, deltapsi, pval, FDR, sample)
+D63 <- tibble(read.table("psidat/Burke2020/psis2/LABRAT.psis.pval.Day63", header = TRUE)) %>% 
+  mutate(sample = "Day63") %>% dplyr::select(Gene, genetype, deltapsi, pval, FDR, sample)
+D77 <- tibble(read.table("psidat/Burke2020/psis2/LABRAT.psis.pval.Day77", header = TRUE)) %>% 
+  mutate(sample = "Day77") %>% dplyr::select(Gene, genetype, deltapsi, pval, FDR, sample)
+D77_NA <- tibble(read.table("psidat/Burke2020/psis2/LABRAT.psis.pval.Day77_NeuronsAlone", header = TRUE)) %>% 
+  mutate(sample = "Day77_NA") %>% dplyr::select(Gene, genetype, deltapsi, pval, FDR, sample)
+
+
+
+dpsis <- bind_rows(D06, D09, D15, D21, D49, D63, D77, D77_NA) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% hs2UTRids) # get rid of genes with more than 2 isoforms (50% of genes kept)
+
+```
+
+### Generally, what does this data look like?
+
+```{r, general look, warning = FALSE}
+# Globally, Brain has the highest psi value
+psis_tidy %>% 
+    ggplot(aes(x = TP, y = psi, fill = TP)) +  
+    geom_violin(alpha = 0.65) + 
+    geom_boxplot(width = 0.1, col = c("#dddddd", "#dddddd", "#dddddd",  "#dddddd", "#dddddd", "#dddddd", "#dddddd", "#818181", "#818181")) +
+    theme_cowplot() +
+    guides(fill = FALSE, alpha = FALSE) +
+    labs(x = "", title = "Human Burke2020 Psi Data") +
+    scale_fill_manual(values = viridis::viridis(9))
+
+psis_tidy %>% left_join(dpsis) %>% 
+    filter(FDR < 0.05) %>% 
+    ggplot(aes(x = TP, y = psi, fill = TP)) + 
+    geom_violin(alpha = 0.65) + 
+    geom_boxplot(width = 0.1, col = c("#dddddd", "#dddddd", "#dddddd",  "#dddddd", "#dddddd", "#dddddd", "#dddddd", "#818181", "#818181")) +
+    theme_cowplot() +
+    guides(fill = FALSE, alpha = FALSE) +
+    labs(x = "", title = "Human Burke2020 Significant Psi Data") +
+    scale_fill_manual(values = viridis::viridis(9))
+
+##Theres is a bias for psis to be significant in the -dpsi direction (~55% of sig are -dpsi)
+
+# which changes first? TUTRs or ALEs?
+psis_tidy %>% 
+  filter(genetype != "mixed") %>% 
+  ggplot(aes(x = factor(TP), y = psi, fill = TP)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.1, col = c("#dddddd", "#dddddd", "#dddddd", "#dddddd", "#dddddd", "#dddddd","#dddddd", "#818181", "#818181", "#dddddd", "#dddddd", "#dddddd", "#dddddd", "#dddddd", "#dddddd","#dddddd", "#818181", "#818181")) +
+  theme_cowplot() + 
+  guides(fill = FALSE) + 
+  theme(text = element_text(size=25), axis.text = element_text(size = 15)) +
+  labs(x = "") +
+  facet_wrap(.~genetype, nrow = 2)  +
+    scale_fill_manual(values = viridis::viridis(9)) +
+  theme(strip.background = element_rect(color = "white", fill = "white"))
+
+psis_tidy %>% 
+    filter(genetype != "mixed") %>% 
+    ggpubr::ggline(x = "TP", y = "psi", color = "genetype", add = "mean_se", size = 1.5, title = "Changes in psi of gene types across timepoints", xlab = "") + 
+    stat_compare_means(aes(group = genetype), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = 0.56) +
+    scale_color_manual(values = c("#78dce8", "#ff6188")) +
+    scale_x_discrete(limits = c("Day02", "Day06", "Day09", "Day15", "Day21", "Day49", "Day63", "Day77", "NEURONS")) 
+
+```
+
+### We define genes with preferential long isoform usage in brain by identifying clusters of genes with shared behaviors
+
+```{r, define mouse genes by trend, warning = FALSE}
+# filter out genes with low std
+filtData <- psis_tidy %>% 
+  group_by(Gene, TP) %>% 
+  summarise(mean_psi = mean(psi, na.rm = TRUE)) %>% 
+  spread(TP, mean_psi) %>% 
+  ungroup() %>% 
+  mutate(std = matrixStats::rowSds(as.matrix(.[c(2:10)]))) %>% 
+  filter(std != 0) %>% 
+  dplyr::select(-std)
+
+# log transform data
+clustData <- filtData %>% 
+  select_if(is.numeric) %>%
+  mutate_all(funs(log10(1 + .))) %>%
+  as.matrix()
+
+rownames(clustData) <- filtData$Gene
+
+# scale data
+s_clustData <- t(scale(t(clustData))) 
+
+# kmeans cluster 3 seems cool...
+set.seed(1)
+kclust <- pheatmap::pheatmap(mat = s_clustData[,c(1:8)],
+                             cluster_cols = F,
+                             scale = "row",
+                             kmeans_k = 4,
+                             color = viridis::viridis(21),
+                             breaks = seq(-1.5, 1.5, by = 0.15))
+# 990 genes in k3
+hsDiff_genes <- data.frame(Cluster=kclust$kmeans$cluster,
+                          Gene=names(kclust$kmeans$cluster)) %>% 
+  as_tibble() %>% 
+  filter(Cluster == 2) %>% 
+  na.omit() %>% 
+  pull(Gene) %>% 
+  unique() %>% 
+  as.character()
+
+# 990 NR genes 2386 control genes
+hsDiff_ctrl_genes <- psis_tidy %>%
+  filter(TP == "Day49" | TP == "Day63" | TP == "Day77", Gene %notin% hsDiff_genes) %>% 
+  na.omit() %>% 
+  pull(Gene) %>% 
+  unique() %>% 
+  as.character()
+
+#saveRDS(hsDiff_genes, "psidat/Burke2020/hsDiff_genes.txt")
+#saveRDS(hsDiff_ctrl_genes, "psidat/Burke2020/hsDiff_ctrl_genes.txt")
+
+```
+
+```{r, psis over time}
+library(ggridges)
+
+psis_tidy %>% 
+  mutate(group = ifelse(Gene %in% hsDiff_genes, "NR", ifelse(Gene %in% hsDiff_ctrl_genes, "ctrl", "NA"))) %>% 
+  separate(temp, into = c("cell_line", "TP"), sep = "_", extra = "merge") %>% 
+  separate(TP, into = c("TP", "rep"), sep = "_rep", fill = "right") %>% 
+  filter(genetype == "ALE", TP != "NEURONS_ALONE_77") %>% 
+  mutate(group = ifelse(group == "NR", "Bypassed ALE PAS (269)", "Unbypassed ALE PAS (789)")) %>% 
+  ggpubr::ggline(x = "TP", y = "psi", color = "group", add = "mean", size = 1.5, title = "Human ALE Psi", xlab = "", ylab = "psi") +
+  scale_x_discrete(limits = c("ACC_DORSAL_2", "ACC_DORSAL_6", "ACC_DORSAL_9", "NPC_15", "ROSETTE_21", "NEURONS_PLUS_ASTROS_49", "NEURONS_PLUS_ASTROS_63", "NEURONS_PLUS_ASTROS_77")) +
+  theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1)) +
+  scale_color_manual(values = c("Red", "Blue"))
+
+psis_tidy %>% 
+  mutate(group = ifelse(Gene %in% hsDiff_genes, "NR", ifelse(Gene %in% hsDiff_ctrl_genes, "ctrl", "NA"))) %>% 
+  separate(temp, into = c("cell_line", "TP"), sep = "_", extra = "merge") %>% 
+  separate(TP, into = c("TP", "rep"), sep = "_rep", fill = "right") %>% 
+  filter(genetype == "TUTR", TP != "NEURONS_ALONE_77") %>% 
+  mutate(group = ifelse(group == "NR", "Bypassed TUTR PAS (706)", "Unbypassed TUTR PAS (1993)")) %>% 
+  ggpubr::ggline(x = "TP", y = "psi", color = "group", add = "mean", size = 1.5, title = "Human TUTR Psi", xlab = "", ylab = "psi") +
+  scale_x_discrete(limits = c("ACC_DORSAL_2", "ACC_DORSAL_6", "ACC_DORSAL_9", "NPC_15", "ROSETTE_21", "NEURONS_PLUS_ASTROS_49", "NEURONS_PLUS_ASTROS_63", "NEURONS_PLUS_ASTROS_77")) +
+  theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1)) +
+  scale_color_manual(values = c("Red", "Blue"))
+
+dpsis %>% 
+  mutate(group = ifelse(Gene %in% hsDiff_genes, "NR", ifelse(Gene %in% hsDiff_ctrl_genes, "ctrl", "NA"))) %>% 
+  filter(genetype == "ALE", sample != "Day77_NA") %>% 
+  mutate(group = ifelse(group == "NR", "Bypassed ALE PAS (269)", "Unbypassed ALE PAS (789)")) %>% 
+  ggpubr::ggline(x = "sample", y = "deltapsi", color = "group", add = "mean", size = 1.5, title = "Human ALE Delta Psi", xlab = "", ylab = "delta psi") +
+  scale_x_discrete(labels = c("ACC_DORSAL_6", "ACC_DORSAL_9", "NPC_15", "ROSETTE_21", "NEURONS_PLUS_ASTROS_49", "NEURONS_PLUS_ASTROS_63", "NEURONS_PLUS_ASTROS_77")) +
+  theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1)) +
+  scale_color_manual(values = c("Red", "Blue"))
+
+dpsis %>% 
+  mutate(group = ifelse(Gene %in% hsDiff_genes, "NR", ifelse(Gene %in% hsDiff_ctrl_genes, "ctrl", "NA"))) %>% 
+  filter(genetype == "TUTR", sample != "Day77_NA") %>% 
+  mutate(group = ifelse(group == "NR", "Bypassed TUTR PAS (706)", "Unbypassed TUTR PAS (1993)")) %>% 
+  ggpubr::ggline(x = "sample", y = "deltapsi", color = "group", add = "mean", size = 1.5, title = "Human TUTR Delta Psi", xlab = "", ylab = "delta psi") +
+  scale_x_discrete(labels = c("ACC_DORSAL_6", "ACC_DORSAL_9", "NPC_15", "ROSETTE_21", "NEURONS_PLUS_ASTROS_49", "NEURONS_PLUS_ASTROS_63", "NEURONS_PLUS_ASTROS_77")) +
+  theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1)) +
+  scale_color_manual(values = c("Red", "Blue"))
+
+
+
+gridgepsi <- function(GT,GR, title){
+  ggdraw() + draw_plot(psis_tidy %>% 
+    mutate(group = ifelse(Gene %in% hsDiff_genes, "NR", ifelse(Gene %in% hsDiff_ctrl_genes, "ctrl", "NA"))) %>% 
+    separate(temp, into = c("cell_line", "TP"), sep = "_", extra = "merge") %>% 
+    separate(TP, into = c("TP", "rep"), sep = "_rep", fill = "right") %>% 
+    filter(genetype == GT, TP != "NEURONS_ALONE_77", group == GR) %>% 
+    ggplot(aes(x = psi, y = TP, fill = stat(x))) +
+    geom_density_ridges_gradient(scale = 3, rel_min_height = 0.01) +
+    scale_fill_viridis_c(name = "psi", option = "C") +
+    scale_y_discrete(limits = c("ACC_DORSAL_2", "ACC_DORSAL_6", "ACC_DORSAL_9", "NPC_15", "ROSETTE_21", "NEURONS_PLUS_ASTROS_49", "NEURONS_PLUS_ASTROS_63", "NEURONS_PLUS_ASTROS_77")) +
+    scale_x_continuous(breaks = c(0,0.25,0.5,0.75,1)) +
+    labs(title = title, y = "") +
+    theme_cowplot() ++
+    guides(fill = FALSE), 0, 0, 0.75, 1) + 
+    draw_plot(psis_tidy %>% 
+                mutate(group = ifelse(Gene %in% hsDiff_genes, "NR", ifelse(Gene %in% hsDiff_ctrl_genes, "ctrl", "NA"))) %>% 
+                filter(genetype == GT, TP != "NEURONS", group == GR) %>% 
+                na.omit() %>%
+                unique() %>% 
+                ggplot(aes(y = TP)) +
+                geom_bar() + 
+                theme_cowplot() +
+                scale_y_discrete(limits = c("Day02", "Day06", "Day09", "Day15", "Day21", "Day49", "Day63", "Day77"), 
+                                 labels = c("","","","","","","","")) +
+                labs(x = "", y = "") +
+                theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1)),  0.7, -0.023, 0.2, 0.79)
+}
+
+gridgedpsi <- function(GT,GR,title){
+  ggdraw() + draw_plot(dpsis %>% 
+    mutate(group = ifelse(Gene %in% hsDiff_genes, "NR", ifelse(Gene %in% hsDiff_ctrl_genes, "ctrl", "NA"))) %>% 
+    filter(genetype == GT, sample != "Day77_NA", group == GR) %>%
+    na.omit() %>%
+    ggplot(aes(x = deltapsi, y = sample, fill = stat(x))) +
+    geom_density_ridges_gradient(scale = 3, rel_min_height = 0.01) +
+    scale_fill_viridis_c(name = "deltapsi", option = "C", limits = c(-0.75,0.75), ) +
+    scale_y_discrete(limits = c("Day06", "Day09", "Day15", "Day21", "Day49", "Day63", "Day77")) +
+    labs(title = title, y = "") +
+    theme_cowplot() +
+    geom_vline(xintercept = 0, size = 1.5, linetype = "dashed") +
+    guides(fill = FALSE), 0, 0, 0.75, 1) + 
+    draw_plot(dpsis %>% 
+                mutate(group = ifelse(Gene %in% hsDiff_genes, "NR", ifelse(Gene %in% hsDiff_ctrl_genes, "ctrl", "NA"))) %>% 
+                filter(genetype == GT, sample != "NEURONS_NA", group == GR) %>% 
+                na.omit() %>%  
+                unique() %>% 
+                ggplot(aes(y = sample)) +
+                geom_bar() + 
+                theme_cowplot() +
+                scale_y_discrete(limits = c("Day06", "Day09", "Day15", "Day21", "Day49", "Day63", "Day77"), 
+                                 labels = c("","","","","","","","")) +
+                labs(x = "", y = "") +
+                theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1)),  0.7, 0, 0.2, 0.84)
+}
+
+gridgepsi("ALE", "NR", "Human NR ALE Psi")
+gridgedpsi("ALE", "NR", "Human NR ALE Delta Psi")
+gridgepsi("TUTR", "NR", "Human NR TUTR Psi")
+gridgedpsi("TUTR", "NR", "Human NR TUTR Delta Psi")
+
+gridgepsi("ALE", "ctrl", "Human Ctrl ALE Psi")
+gridgedpsi("ALE", "ctrl", "Human Ctrl ALE Delta Psi")
+gridgepsi("TUTR", "ctrl", "Human Ctrl TUTR Psi")
+gridgedpsi("TUTR", "ctrl", "Human Ctrl TUTR Delta Psi")
+
+```
+
+```{r, NR genes compared}
+TC_gene_types <- psis_tidy %>% 
+  filter(Gene %in% hsDiff_genes) %>% 
+  dplyr::select(Gene, genetype) %>% 
+  unique() %>% group_by(genetype) %>% 
+  na.omit() %>% 
+  summarise(Diff = n())
+
+TC_gene_types %>% 
+    mutate(Diff = round(Diff/sum(Diff)*100,1)) %>% 
+    gather(-genetype, key = group, value = Percent) %>% 
+    mutate(label = paste(genetype, "\n", as.character(Percent), "%", sep = ""),
+           group = ifelse(group == "Both", "Both\nN= ", ifelse(group == "Diff", "Differentiation\nN=1373", "Tissue\nN= "))) %>% 
+    ggplot(aes(x = group, y = Percent, fill = genetype)) +
+    geom_bar(stat ="identity") +
+    theme_cowplot() +
+    labs(x = "", title = "Human NR genetypes from cluster3") +
+    geom_text(size = 3, position = position_stack(vjust = 0.5), aes(label = label)) +
+    guides(fill = FALSE) +
+    scale_fill_manual(values = c("#fc9867", "#a9dc76", "#78dce8"))
+
+mm_TC_NR_genes <- tibble(read.table("psidat/mm_NR_gene_table.txt", header = TRUE)) %>% filter(Diff == TRUE) %>% pull(Gene)
+h2m <- as_tibble(readRDS("psidat/human2mousegeneid.txt"))
+mm_TC_NR_ortho <- h2m %>% filter(mouse_gene %in% mm_TC_NR_genes) %>% pull(ensembl_gene_id)
+
+phyper(114, 1373, 2858-1373, 735, lower.tail = FALSE) #not sig overlap with mm NR from Differentiation
+
+```
+
+# Now for looking at Sequence around the Proximal PAS of NR genes
+100 nucleotides upstream of the proximal UTR end (PAS or polyadenylation site) and 100 nt were extracted for Neuronally restricted and control genes
+
+```{r, get flanking PAS seqs}
+
+
+hsDiff_prox_genes <- unlist(lapply(hsDiff_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+
+hsDiff_prox_ctrl_genes <- unlist(lapply(hsDiff_ctrl_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+
+export_seqs <- function(tx_list, file_name, species){
+  
+  if (species == "mm"){
+    
+    tx_gff <- promoters(mmpolya_txdb, upstream = 100, downstream = 100)
+    tx_gff <- tx_gff[names(tx_gff) %in% tx_list]
+    seq <- getSeq(Mmusculus, tx_gff)
+    
+  } else if (species == "hs"){
+    
+    tx_gff <- promoters(polya_txdb, upstream = 100, downstream = 100)
+    tx_gff <- tx_gff[names(tx_gff) %in% tx_list]
+    seq <- getSeq(Hsapiens, tx_gff)
+  
+  }
+  
+  writeXStringSet(seq, paste(file_name, ".fa", sep = ""), format = "fasta")
+}
+
+export_seqs(hsDiff_prox_genes, "psidat/Burke2020/NR_TC_ds_PAS", "hs")
+export_seqs(hsDiff_prox_ctrl_genes, "psidat/Burke2020/ctrl_TC_ds_PAS", "hs")
+
+PAS <- readDNAStringSet("psidat/Burke2020/NR_TC_ds_PAS.fa")
+ctrl_PAS <- readDNAStringSet("psidat/Burke2020/ctrl_TC_ds_PAS.fa")
+
+```
+
+## U content around Proximal PAS
+
+```{r, }
+ds_U <- get_U(subseq(PAS, start = 101, end = 200)) %>% 
+  mutate(gene = substr(gene, 1, 15))
+ds_ctrl_U <- get_U(subseq(ctrl_PAS, start = 101, end = 200)) %>% 
+  mutate(gene = substr(gene, 1, 15))
+ds_U_compare <- U_compare(subseq(PAS, start = 101, end = 200), subseq(ctrl_PAS, start = 101, end = 200))
+ds_U_compare
+
+us_U <- get_U(subseq(PAS, start = 1, end = 101)) %>% 
+  mutate(gene = substr(gene, 1, 15))
+us_ctrl_U <- get_U(subseq(ctrl_PAS, start = 1, end = 101)) %>% 
+  mutate(gene = substr(gene, 1, 15))
+us_U_compare <- U_compare(subseq(PAS, start = 1, end = 101), subseq(ctrl_PAS, start = 1, end = 101))
+us_U_compare
+
+All_U_compare<- rbind(us_U_compare, ds_U_compare) %>% 
+  as_tibble() %>% 
+  mutate(group = c("Upstream", "Downstream")) 
+
+All_U_compare %>%  
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(All_U_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("Upstream", "Downstream")) + 
+  labs(title = "U content of Proximal PAS (NR/Control)", subtitle = "NR genes are more U rich around proximal PAS than Control  Genes \nThis is especially true downstream", x = "")
+
+all_U <- ds_U %>% 
+  dplyr::rename("NR_ds" = U) %>% 
+  full_join(., ds_ctrl_U) %>% 
+  dplyr::rename("Control_ds" = U) %>%
+  full_join(., us_U) %>% 
+  dplyr::rename("NR_us" = U) %>%
+  full_join(., us_ctrl_U) %>% 
+  dplyr::rename("Control_us" = U) %>%
+  gather(-gene, key = group, value = U) %>% 
+  separate(group, into = c("group", "region"), sep = "_") %>% 
+  left_join(., genetypes, by = c("gene" = "Gene")) %>% 
+  na.omit()
+
+all_U %>% 
+  ggplot(aes(x = factor(group, levels = c("NR", "Control")), y = U, fill = factor(group, levels = c("NR", "Control")))) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot()  + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  facet_grid(.~factor(region, levels = c("us", "ds"), labels = c("Upstream", "Downstream"))) +
+  labs(x = "", title = "U content around Proximal PAS", subtitle = "NR genes are more U rich upstream and downstream of Proximal PAS") +
+  scale_fill_manual(values = c("#ffd866", "#cfd0e4")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"))
+
+all_U %>% 
+  filter(genetype != "mixed") %>% 
+  ggplot(aes(x = factor(group, levels = c("NR", "Control")), y = U, fill = factor(group, levels = c("NR", "Control")))) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(genetype~factor(region, levels = c("us", "ds"), labels = c("Upstream", "Downstream"))) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  EnvStats::stat_n_text() +
+  labs(x = "", title = "U content around Proximal PAS by Genetype", subtitle = "Both UTR types contribute to U richness downstream of proxmial PAS", y = "U content") +
+  scale_fill_manual(values = c("#ffd866", "#cfd0e4")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"),
+        strip.text.y = element_text(size = 12, color = "Black", face = "bold"))
+
+```
+
+## U content across the PAS (binned)
+U content is binned across the 200 nt sequence
+
+```{r, Ucontent metagenes}
+
+# all UTR types together
+metagene_flank_nt(PAS, ctrl_PAS, "T", "NR, N = 1373", "Control, N = 3994", "U Content around Proximal PAS") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+
+#Tandem
+metagene_flank_nt(PAS[names(PAS)[names(PAS) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], ctrl_PAS[names(ctrl_PAS)[names(ctrl_PAS) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "T", "NR, N = 874", "Control, N = 1763", "Proximal PAS TUTR U Content") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+
+#ALEs
+metagene_flank_nt(PAS[names(PAS)[names(PAS) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], ctrl_PAS[names(ctrl_PAS)[names(ctrl_PAS) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "T", "NR, N = 314", "Control, N = 772", "Proximal PAS ALE U Content") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+
+```
+
+
+```{r, kmers}
+PAS_kmer_compare <- kmer_compare(subseq(PAS, start = 101, end = 200), subseq(ctrl_PAS, start = 101, end = 200), 5) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+PAS_kmer_compare
+kmer_plot(PAS_kmer_compare) + ggtitle("Kmers downstream of Proximal PAS (NRvControl)") + labs(x = "5-mer Enrichment, log2")
+
+enr_kmer <- PAS_kmer_compare %>% filter(log2FC > 0, p_adj < 0.05) %>% pull(kmer)
+dep_kmer <- PAS_kmer_compare %>% filter(log2FC < 0, p_adj < 0.05) %>% pull(kmer)
+
+#kmer2logo(enr_kmer, "kmers enriched downstream of PAS in NR genes")
+#kmer2logo(dep_kmer, "kmers depleted downstream of PAS in NR genes")
+
+```
+
+```{r, motifs not binned, warning=FALSE}
+flank_motif_pos_df <- function(PWM_list, caseDNAStringSet, ctrlDNAStringSet, title){
+
+   case_list <- lapply(PWM_list, function(x) lapply(caseDNAStringSet, function(y) matchPWM(x,y) %>% data.frame(start = start(.), end = end(.)))) %>% unlist(recursive = FALSE)
+   case_list <- lapply(case_list, function(x) if(nrow(x) == 0) data.frame(. = NA, start = NA, end = NA) else x)
+  
+   case_df <- case_list %>% 
+    bind_rows(., .id = "key") %>% 
+    as_tibble() %>% 
+    dplyr::rename("match" = 2) %>% 
+    separate(key, into = c("motif", "RBP", "gene", "UTR"), extra = "merge") %>%
+    mutate(pos = round(((end - start)*0.5) + start), 
+           bin = ifelse(pos > 0 & pos <= 20, "-100", 
+                        ifelse(pos > 20 & pos <= 40, "-80", 
+                               ifelse(pos > 40 & pos <= 60, "-60",
+                                      ifelse(pos > 60 & pos <= 80, "-40",
+                                             ifelse(pos > 80 & pos <= 100, "-20", 
+                                                           ifelse(pos > 100 & pos <= 120, "20",
+                                                                  ifelse(pos > 120 & pos <= 140, "40", 
+                                                                         ifelse(pos > 140 & pos <= 160, "60", 
+                                                                                ifelse(pos > 160 & pos <= 180, "80",
+                                                                                       ifelse(pos > 180 & pos <= 200, "100", "")))))))))))  %>% 
+    mutate(group = "NR")
+  
+   ctrl_list <- lapply(PWM_list, function(x) lapply(ctrlDNAStringSet, function(y) matchPWM(x,y) %>% data.frame(start = start(.), end = end(.)))) %>% unlist(recursive = FALSE)
+   ctrl_list <- lapply(ctrl_list, function(x) if(nrow(x) == 0) data.frame(. = NA, start = NA, end = NA) else x)
+   
+  ctrl_df <- ctrl_list %>% 
+    bind_rows(., .id = "key") %>% 
+    as_tibble() %>% 
+    dplyr::rename("match" = 2) %>% 
+    separate(key, into = c("motif", "RBP", "gene", "UTR"), extra = "merge") %>%
+    mutate(pos = round(((end - start)*0.5) + start), 
+           bin = ifelse(pos > 0 & pos <= 20, "-100", 
+                        ifelse(pos > 20 & pos <= 40, "-80", 
+                               ifelse(pos > 40 & pos <= 60, "-60",
+                                      ifelse(pos > 60 & pos <= 80, "-40",
+                                             ifelse(pos > 80 & pos <= 100, "-20", 
+                                                           ifelse(pos > 100 & pos <= 120, "20",
+                                                                  ifelse(pos > 120 & pos <= 140, "40", 
+                                                                         ifelse(pos > 140 & pos <= 160, "60", 
+                                                                                ifelse(pos > 160 & pos <= 180, "80",
+                                                                                       ifelse(pos > 180 & pos <= 200, "100", "")))))))))))  %>%
+    mutate(group = "ctrl")
+    
+  hit_df <- rbind(case_df, ctrl_df)  
+  #y_label <- hit_df %>% group_by(bin, group, RBP) %>% summarize(mean = mean(count), .groups = "drop") %>% pull(mean) %>% max()
+  
+#    p <- hit_df %>% ggline(x = "bin", y = "count", color = "group", add = "mean_se", size = 1.5, title = title, facet.by = "RBP", scales = "free_y", xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y.npc = 0.07) + scale_x_discrete(labels = c("-100", "-80", "-60", "-40", "-20", "0", "20", "40", "60", "80", "100")) 
+ 
+  return(hit_df)
+}
+
+Hu_PWM <- c(RBNS_PWM[names(RBNS_PWM)[grepl(names(RBNS_PWM), pattern = "ELAV")]], CISBPRNA_hs_PWM[names(CISBPRNA_hs_PWM)[grepl(names(CISBPRNA_hs_PWM), pattern = "ELAV")]])
+names(Hu_PWM) <- c("RBNS1_ELAVL4", "RBNS2_ELAVL4", "M031_ELAVL1", "M108_ELAVL1", "M112_ELAVL1", "M124_ELAVL3", "M127_ELAVL1", "M232_ELAVL1", "M328_ELAVL2", "M329_ELAVL2", "M330_ELAVL2")
+
+all_Hu_pos_df <- flank_motif_pos_df(Hu_PWM, PAS, ctrl_PAS)
+ranks <- all_Hu_pos_df %>% filter(bin > 0) %>% group_by(group,RBP,gene) %>% summarize(n=n()) %>% group_by(group,RBP) %>% mutate(rank = order(order(n, decreasing = TRUE))) %>% arrange(group,RBP, desc(n)) %>% dplyr::select(gene,group,RBP,rank) %>% ungroup()
+
+summed_motifs_pos <- all_Hu_pos_df  %>%
+    mutate(count = ifelse(!is.na(match), 1, 0)) %>% 
+    spread(pos,count) %>% 
+    dplyr::select(-motif, -UTR, -match, -start, -end, -bin, -206) %>% 
+    ungroup()
+
+summed_motifs_pos[is.na(summed_motifs_pos)] <- 0
+
+ranked_motif_pos <- summed_motifs_pos %>% group_by(RBP,gene,group) %>% summarize_all(funs(sum)) %>% left_join(., ranks) %>% arrange(desc(group), rank) %>% ungroup() %>% dplyr::select(RBP, gene, group, rank, everything())
+
+ranked_motif_pos[,5:198][1 < ranked_motif_pos[,5:198]] <- 1
+
+###tables for seungjae
+hs_motif_dsPAS <- ranked_motif_pos %>% mutate(species = "human") %>% 
+  dplyr::select(gene, RBP, group, species, everything(), -rank)
+  
+colnames(hs_motif_dsPAS) <- c("gene", "RBP", "group", "species", c(-98:-1), c(1:99))
+
+#motif_dsPAS <- rbind(hs_motif_dsPAS, mm_motif_dsPAS) 
+###
+
+
+
+##ELAVL1
+annodf1 <- ranked_motif_pos %>% filter(RBP == "ELAVL1")  %>% mutate(group = as.factor(group)) %>% dplyr::select(group) %>% as.data.frame()
+rownames(annodf1) <- ranked_motif_pos %>% filter(RBP == "ELAVL1") %>% pull(gene)
+
+p1 <- ranked_motif_pos %>% filter(RBP == "ELAVL1") %>% dplyr::select(5:200) %>% as.matrix()
+rownames(p1) <- ranked_motif_pos %>% filter(RBP == "ELAVL1") %>% pull(gene)
+p1_list <- t(p1) %>% as.data.frame() %>% data.table::frollmean(., 10, align = "center")
+names(p1_list) <- rownames(p1)
+p1rolled <- p1_list %>% bind_rows() %>% t()
+colnames(p1rolled) <- c(1:ncol(p1rolled))
+
+##ELAVL2
+
+annodf2 <- ranked_motif_pos %>% filter(RBP == "ELAVL2")  %>% mutate(group = as.factor(group)) %>% dplyr::select(group) %>% as.data.frame()
+rownames(annodf2) <- ranked_motif_pos %>% filter(RBP == "ELAVL2") %>% pull(gene)
+
+p2 <- ranked_motif_pos %>% filter(RBP == "ELAVL2") %>% dplyr::select(5:200) %>% as.matrix()
+rownames(p2) <- ranked_motif_pos %>% filter(RBP == "ELAVL2") %>% pull(gene)
+p2_list <- t(p2) %>% as.data.frame() %>%  data.table::frollmean(., 10, align = "center")
+names(p2_list) <- rownames(p2)
+p2rolled <- p2_list %>% bind_rows() %>% t()
+colnames(p2rolled) <- c(1:ncol(p2rolled))
+
+
+##ELAVL3
+
+annodf3 <- ranked_motif_pos %>% filter(RBP == "ELAVL3")  %>% mutate(group = as.factor(group)) %>% dplyr::select(group) %>% as.data.frame()
+rownames(annodf3) <- ranked_motif_pos %>% filter(RBP == "ELAVL3") %>% pull(gene)
+
+p3 <- ranked_motif_pos %>% filter(RBP == "ELAVL3") %>% dplyr::select(5:200) %>% as.matrix()
+rownames(p3) <- ranked_motif_pos %>% filter(RBP == "ELAVL3") %>% pull(gene)
+p3_list <- t(p3) %>% as.data.frame() %>%  data.table::frollmean(., 10, align = "center")
+names(p3_list) <- rownames(p3)
+p3rolled <- p3_list %>% bind_rows() %>% t()
+colnames(p3rolled) <- c(1:ncol(p3rolled))
+
+##ELAVL4
+annodf4 <- ranked_motif_pos %>% filter(RBP == "ELAVL4")  %>% mutate(group = as.factor(group)) %>% dplyr::select(group) %>% as.data.frame()
+rownames(annodf4) <- ranked_motif_pos %>% filter(RBP == "ELAVL4") %>% pull(gene)
+
+p4 <- ranked_motif_pos %>% filter(RBP == "ELAVL4") %>% dplyr::select(5:200) %>% as.matrix()
+rownames(p4) <- ranked_motif_pos %>% filter(RBP == "ELAVL4") %>% pull(gene)
+p4_list <- t(p4) %>% as.data.frame() %>% data.table::frollmean(., 10, align = "center")
+names(p4_list) <- rownames(p4)
+p4rolled <- p4_list %>% bind_rows() %>% t()
+colnames(p4rolled) <- c(1:ncol(p4rolled))
+
+```
+
+
+```{r, motif line plots, warning=FALSE}
+##ELAVL1
+#all together raw
+ y_label <- ranked_motif_pos %>% filter(RBP == "ELAVL1") %>% gather(-gene, -group, -RBP, -rank, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+colnames(ranked_motif_pos) <- c("RBP", "gene", "group", "rank", as.character(c(-97:98)))
+ranked_motif_pos %>% filter(RBP == "ELAVL1") %>% dplyr::select(-gene, -RBP, -rank) %>% gather(-group, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL1", xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75))
+
+#faceted raw
+y_label <- ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL1", genetype == "TUTR") %>% dplyr::select(-gene, -RBP, -rank) %>% gather(-group,-genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL1", genetype != "mixed") %>% dplyr::select(-gene, -RBP, -rank) %>% gather(-group,-genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL1", xlab = "Position around PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#altogether ds raw
+y_label <- ranked_motif_pos %>% dplyr::select(gene, RBP, group, as.character(10:98)) %>% filter(RBP == "ELAVL1") %>% gather(-group, -gene, -RBP, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+ranked_motif_pos %>% dplyr::select(gene, RBP, group, as.character(10:98)) %>% filter(RBP == "ELAVL1") %>% gather(-group, -gene, -RBP, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL1", xlab = "Position downstream of PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90))
+
+#faceted ds raw
+y_label <- ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL1", genetype == "TUTR") %>% dplyr::select(group, genetype, as.character(10:98)) %>% gather(-group,-genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL1", genetype != "mixed") %>% dplyr::select(group, genetype, as.character(10:98)) %>% gather(-group,-genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL1", xlab = "Position downstream of PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90))  + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#altogether rolled
+colnames(p1rolled) <- c(-97:98)
+y_label <- p1rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf1, rownames = "gene")) %>% gather(-gene, -group, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p1rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf1, rownames = "gene")) %>% gather(-gene, -group, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL1", xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75))
+ 
+#faceted rolled
+y_label <- p1rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf1, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "TUTR") %>% dplyr::select(-gene) %>% gather(-group,-genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p1rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf1, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype != "mixed") %>% dplyr::select(-gene) %>% gather(-group,-genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL1", xlab = "Position around PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#altogether ds rolled
+y_label <- p1rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf1, rownames = "gene")) %>%  dplyr::select("gene", "group", as.character(10:98))%>% gather(-gene, -group, key = pos, value = counts)%>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p1rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf1, rownames = "gene")) %>%  dplyr::select("gene", "group", as.character(10:98)) %>% gather(-gene, -group, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL1", xlab = "Position downstream of PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90))
+
+#faceted ds rolled
+y_label <- p1rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf1, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "TUTR") %>% dplyr::select("group","genetype", as.character(10:98)) %>% gather(-group, -genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p1rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf1, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype != "mixed") %>% dplyr::select("group","genetype", as.character(10:98)) %>% gather(-group, -genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL1", xlab = "Position downstream of PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90)) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#plot for Seungjae
+p1rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf1, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "ALE") %>% dplyr::select("group","genetype", as.character(c(10:98))) %>% gather(-group, -genetype, key = pos, value = counts) %>% mutate(group = ifelse(group == "NR", "Bypassed ALE PAS (269)", "Unbypassed ALE PAS (789)")) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human ALE ELAVL1", xlab = "position downstream to polyA site", ylab = "Motif frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.036) + scale_x_discrete(breaks=c(10,30,50,70,90)) + stat_summary(aes(x=pos,y=counts, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+p1rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf1, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "TUTR") %>% dplyr::select("group","genetype", as.character(c(10:98))) %>% gather(-group, -genetype, key = pos, value = counts) %>% mutate(group = ifelse(group == "NR", "Bypassed TUTR PAS (706)", "Unbypassed TUTR PAS (1993)")) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human TUTR ELAVL1", xlab = "position downstream to polyA site", ylab = "Motif frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.036) + scale_x_discrete(breaks=c(10,30,50,70,90)) + scale_x_discrete(breaks=c(10,30,50,70,90)) + stat_summary(aes(x=pos,y=counts, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+##ELAVL2
+#altogether raw
+ y_label <- ranked_motif_pos %>% filter(RBP == "ELAVL2") %>% gather(-gene, -group, -RBP, -rank, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+colnames(ranked_motif_pos) <- c("RBP", "gene", "group", "rank", as.character(c(-97:98)))
+ranked_motif_pos %>% filter(RBP == "ELAVL2") %>% dplyr::select(-gene, -RBP, -rank) %>% gather(-group, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL2", xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75))
+
+#faceted raw
+y_label <- ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL2", genetype == "TUTR") %>% dplyr::select(-gene, -RBP, -rank) %>% gather(-group,-genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL2", genetype != "mixed") %>% dplyr::select(-gene, -RBP, -rank) %>% gather(-group,-genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL2", xlab = "Position around PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#altogether ds raw
+y_label <- ranked_motif_pos %>% dplyr::select(gene, RBP, group, as.character(10:98)) %>% filter(RBP == "ELAVL2") %>% gather(-group, -gene, -RBP, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+ranked_motif_pos %>% dplyr::select(gene, RBP, group, as.character(10:98)) %>% filter(RBP == "ELAVL2") %>% gather(-group, -gene, -RBP, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL2", xlab = "Position downstream of PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90))
+
+#faceted ds raw
+y_label <- ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL2", genetype == "TUTR") %>% dplyr::select(group, genetype, as.character(10:98)) %>% gather(-group,-genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL2", genetype != "mixed") %>% dplyr::select(group, genetype, as.character(10:98)) %>% gather(-group,-genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL2", xlab = "Position downstream of PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90))  + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#altogether rolled
+colnames(p2rolled) <- c(-97:98)
+y_label <- p2rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf2, rownames = "gene")) %>% gather(-gene, -group, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p2rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf2, rownames = "gene")) %>% gather(-gene, -group, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL2", xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75))
+ 
+#faceted rolled
+y_label <- p2rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf2, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "TUTR") %>% dplyr::select(-gene) %>% gather(-group,-genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p2rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf2, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype != "mixed") %>% dplyr::select(-gene) %>% gather(-group,-genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL2", xlab = "Position around PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#altogther ds rolled
+y_label <- p2rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf2, rownames = "gene")) %>%  dplyr::select("gene", "group", as.character(10:98))%>% gather(-gene, -group, key = pos, value = counts)%>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p2rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf2, rownames = "gene")) %>%  dplyr::select("gene", "group", as.character(10:98)) %>% gather(-gene, -group, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL2", xlab = "Position downstream of PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90))
+
+#faceted ds rolled
+y_label <- p2rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf2, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "TUTR") %>% dplyr::select("group","genetype", as.character(10:98)) %>% gather(-group, -genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p2rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf2, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype != "mixed") %>% dplyr::select("group","genetype", as.character(10:98)) %>% gather(-group, -genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL2", xlab = "Position downstream of PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90)) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#plot for Seungjae
+p2rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf2, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "ALE") %>% dplyr::select("group","genetype", as.character(c(10:98))) %>% gather(-group, -genetype, key = pos, value = counts) %>% mutate(group = ifelse(group == "NR", "Bypassed ALE PAS (269)", "Unbypassed ALE PAS (789)")) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human ALE ELAVL2", xlab = "position downstream to polyA site", ylab = "Motif frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.017) + scale_x_discrete(breaks=c(10,30,50,70,90)) + scale_x_discrete(breaks=c(10,30,50,70,90)) + stat_summary(aes(x=pos,y=counts, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+p2rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf2, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "TUTR") %>% dplyr::select("group","genetype", as.character(c(10:98))) %>% gather(-group, -genetype, key = pos, value = counts) %>% mutate(group = ifelse(group == "NR", "Bypassed TUTR PAS (706)", "Unbypassed TUTR PAS (1993)")) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human TUTR ELAVL2", xlab = "position downstream to polyA site", ylab = "Motif frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.018) + scale_x_discrete(breaks=c(10,30,50,70,90)) + scale_x_discrete(breaks=c(10,30,50,70,90)) + stat_summary(aes(x=pos,y=counts, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+##ELAVL3
+#altogether raw
+ y_label <- ranked_motif_pos %>% filter(RBP == "ELAVL3") %>% gather(-gene, -group, -RBP, -rank, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+colnames(ranked_motif_pos) <- c("RBP", "gene", "group", "rank", as.character(c(-97:98)))
+ranked_motif_pos %>% filter(RBP == "ELAVL3") %>% dplyr::select(-gene, -RBP, -rank) %>% gather(-group, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL3", xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75))
+
+#faceted raw
+y_label <- ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL3", genetype == "TUTR") %>% dplyr::select(-gene, -RBP, -rank) %>% gather(-group,-genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL3", genetype != "mixed") %>% dplyr::select(-gene, -RBP, -rank) %>% gather(-group,-genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL3", xlab = "Position around PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#altogether ds raw
+y_label <- ranked_motif_pos %>% dplyr::select(gene, RBP, group, as.character(10:98)) %>% filter(RBP == "ELAVL3") %>% gather(-group, -gene, -RBP, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+ranked_motif_pos %>% dplyr::select(gene, RBP, group, as.character(10:98)) %>% filter(RBP == "ELAVL3") %>% gather(-group, -gene, -RBP, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL3", xlab = "Position downstream of PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(1,30,60,90))
+
+#faceted ds raw
+y_label <- ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL3", genetype == "TUTR") %>% dplyr::select(group, genetype, as.character(10:98)) %>% gather(-group,-genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL3", genetype != "mixed") %>% dplyr::select(group, genetype, as.character(10:98)) %>% gather(-group,-genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL3", xlab = "Position downstream of PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90))  + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#altogether rolled
+colnames(p3rolled) <- c(-97:98)
+y_label <- p3rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf3, rownames = "gene")) %>% gather(-gene, -group, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p3rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf3, rownames = "gene")) %>% gather(-gene, -group, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL3", xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75))
+
+#faceted rolled
+y_label <- p3rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf3, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "TUTR") %>% dplyr::select(-gene) %>% gather(-group,-genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p3rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf3, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype != "mixed") %>% dplyr::select(-gene) %>% gather(-group,-genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL3", xlab = "Position around PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2) 
+
+#altogether ds rolled
+y_label <- p3rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf3, rownames = "gene")) %>%  dplyr::select("gene", "group", as.character(10:98))%>% gather(-gene, -group, key = pos, value = counts)%>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p3rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf3, rownames = "gene")) %>%  dplyr::select("gene", "group", as.character(10:98)) %>% gather(-gene, -group, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL3", xlab = "Position downstream of PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90))
+
+#faceted ds rolled
+y_label <- p3rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf3, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "TUTR") %>% dplyr::select("group","genetype", as.character(10:98)) %>% gather(-group, -genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p3rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf3, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype != "mixed") %>% dplyr::select("group","genetype", as.character(10:98)) %>% gather(-group, -genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL3", xlab = "Position downstream of PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90)) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#plot for Seungjae
+p3rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf3, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "ALE") %>% dplyr::select("group","genetype", as.character(c(10:98))) %>% gather(-group, -genetype, key = pos, value = counts) %>% mutate(group = ifelse(group == "NR", "Bypassed ALE PAS (269)", "Unbypassed ALE PAS (789)")) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human ALE ELAVL3", xlab = "position downstream to polyA site", ylab = "Motif frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.015) + scale_x_discrete(breaks=c(10,30,50,70,90)) + scale_x_discrete(breaks=c(10,30,50,70,90)) + stat_summary(aes(x=pos,y=counts, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+p3rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf3, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "TUTR") %>% dplyr::select("group","genetype", as.character(c(10:98))) %>% gather(-group, -genetype, key = pos, value = counts) %>% mutate(group = ifelse(group == "NR", "Bypassed TUTR PAS (706)", "Unbypassed TUTR PAS (1993)")) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human TUTR ELAVL3", xlab = "position downstream to polyA site", ylab = "Motif frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.012) + scale_x_discrete(breaks=c(10,30,50,70,90)) + scale_x_discrete(breaks=c(10,30,50,70,90)) + stat_summary(aes(x=pos,y=counts, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+##ELAVL4
+#all together raw
+ y_label <- ranked_motif_pos %>% filter(RBP == "ELAVL4") %>% gather(-gene, -group, -RBP, -rank, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+colnames(ranked_motif_pos) <- c("RBP", "gene", "group", "rank", as.character(c(-97:98)))
+ranked_motif_pos %>% filter(RBP == "ELAVL4") %>% dplyr::select(-gene, -RBP, -rank) %>% gather(-group, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL4", xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75))
+
+#faceted raw
+y_label <- ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL4", genetype == "TUTR") %>% dplyr::select(-gene, -RBP, -rank) %>% gather(-group,-genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL4", genetype != "mixed") %>% dplyr::select(-gene, -RBP, -rank) %>% gather(-group,-genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL4", xlab = "Position around PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#altogether ds raw
+y_label <- ranked_motif_pos %>% dplyr::select(gene, RBP, group, as.character(10:98)) %>% filter(RBP == "ELAVL4") %>% gather(-group, -gene, -RBP, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+ranked_motif_pos %>% dplyr::select(gene, RBP, group, as.character(10:98)) %>% filter(RBP == "ELAVL4") %>% gather(-group, -gene, -RBP, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL4", xlab = "Position downstream of PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90))
+
+#faceted ds raw
+y_label <- ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL4", genetype == "TUTR") %>% dplyr::select(group, genetype, as.character(10:98)) %>% gather(-group,-genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+ranked_motif_pos %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(RBP == "ELAVL4", genetype != "mixed") %>% dplyr::select(group, genetype, as.character(10:98)) %>% gather(-group,-genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL4", xlab = "Position downstream of PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90))  + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#altogether rolled
+colnames(p4rolled) <- c(-97:98)
+y_label <- p4rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf4, rownames = "gene")) %>% gather(-gene, -group, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p4rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf4, rownames = "gene")) %>% gather(-gene, -group, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL4", xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75))
+ 
+#faceted rolled
+y_label <- p4rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf4, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "TUTR") %>% dplyr::select(-gene) %>% gather(-group,-genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p4rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf4, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype != "mixed") %>% dplyr::select(-gene) %>% gather(-group,-genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL4", xlab = "Position around PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#altogether ds rolled
+y_label <- p4rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf4, rownames = "gene")) %>%  dplyr::select("gene", "group", as.character(10:98))%>% gather(-gene, -group, key = pos, value = counts)%>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p4rolled %>% as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf4, rownames = "gene")) %>%  dplyr::select("gene", "group", as.character(10:98)) %>% gather(-gene, -group, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL4", xlab = "Position downstream of PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90))
+
+#faceted ds rolled
+y_label <- p4rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf4, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "TUTR") %>% dplyr::select("group","genetype", as.character(10:98)) %>% gather(-group, -genetype, key = pos, value = counts) %>% group_by(pos, group) %>% summarize(mean = mean(counts), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+p4rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf4, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype != "mixed") %>% dplyr::select("group","genetype", as.character(10:98)) %>% gather(-group, -genetype, key = pos, value = counts) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean_se", size = 1.5, title = "ELAVL4", xlab = "Position downstream of PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.005) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90)) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + facet_wrap(.~ genetype, nrow = 2)
+
+#plot for Seungjae
+p4rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf4, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "ALE") %>% dplyr::select("group","genetype", as.character(c(10:98))) %>% gather(-group, -genetype, key = pos, value = counts) %>% mutate(group = ifelse(group == "NR", "Bypassed ALE PAS (269)", "Unbypassed ALE PAS (789)")) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human ALE ELAVL4", xlab = "position downstream to polyA site", ylab = "Motif frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.051) + scale_x_discrete(breaks=c(10,30,50,70,90)) + scale_x_discrete(breaks=c(10,30,50,70,90)) + stat_summary(aes(x=pos,y=counts, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+p4rolled %>%  as_tibble(rownames = "gene") %>% left_join(.,as_tibble(annodf4, rownames = "gene")) %>% left_join(., genetypes, by = c("gene"="Gene")) %>% filter(genetype == "TUTR") %>% dplyr::select("group","genetype", as.character(c(10:98))) %>% gather(-group, -genetype, key = pos, value = counts) %>% mutate(group = ifelse(group == "NR", "Bypassed TUTR PAS (706)", "Unbypassed TUTR PAS (1993)")) %>% ggline(x = "pos", y = "counts", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human TUTR ELAVL4", xlab = "position downstream to polyA site", ylab = "Motif frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.048) + scale_x_discrete(breaks=c(10,30,50,70,90)) + scale_x_discrete(breaks=c(10,30,50,70,90)) + stat_summary(aes(x=pos,y=counts, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+```
+
+#U content across proximal PAS
+
+```{r, U content heat map, warning=FALSE}
+
+x <- c(1:length(PAS))
+NR_list <- lapply(x, function(x) letterFrequencyInSlidingView(PAS[[x]], 1, "T"))
+NR_Df <- bind_cols(NR_list) %>% t() 
+colnames(NR_Df) <- c(1:200)
+rownames(NR_Df) <- names(PAS)
+NR_ranks <- NR_Df[,101:200] %>% rowSums() %>% as_tibble(rownames = "gene") %>% arrange(desc(value)) %>% mutate(rank = c(1:nrow(.)))
+
+x <- c(1:length(ctrl_PAS))
+ctrl_list <- lapply(x, function(x) letterFrequencyInSlidingView(ctrl_PAS[[x]], 1, "T"))
+ctrl_Df <- bind_cols(ctrl_list) %>% t() 
+colnames(ctrl_Df) <- c(1:200)
+rownames(ctrl_Df) <- names(ctrl_PAS)
+ctrl_ranks <- ctrl_Df[,101:200] %>% rowSums() %>% as_tibble(rownames = "gene") %>% arrange(desc(value)) %>% mutate(rank = c(1:nrow(.)))
+
+a <- as_tibble(NR_Df, rownames = "gene") %>% mutate(group = "NR") %>% left_join(NR_ranks) %>% dplyr::select(gene,group, value, rank, everything()) %>% arrange(rank)
+b <- as_tibble(ctrl_Df, rownames = "gene") %>% mutate(group = "ctrl") %>% left_join(ctrl_ranks) %>% dplyr::select(gene,group, value, rank, everything()) %>% arrange(rank)
+p <- rbind(a,b)
+
+###plot data for Seungjae
+
+hs_U_dsPAS <- p %>% mutate(gene = substr(gene, 1, 15),
+                           species = "human") %>%
+  dplyr::select(gene, group, species, everything(), -value, -rank)
+colnames(hs_U_dsPAS) <- c("gene", "group", "species", c(-100:-1), c(1:100))
+
+#U_content_prox_PAS <- rbind(hs_U_dsPAS, mm_U_dsPAS)
+
+###
+
+annodf <- p %>% mutate(group = as.factor(group)) %>% dplyr::select(group) %>% as.data.frame()
+rownames(annodf) <- p$gene
+
+z <- p %>% dplyr::select(-gene, -group, -value, -rank) %>%  as.matrix() 
+rownames(z) <- p$gene
+
+###Rolling means!
+z_list <- t(z) %>% as.data.frame() %>%  data.table::frollmean(., 10, align = "center")
+names(z_list) <- rownames(z)
+zrolled <- z_list %>% bind_rows() %>% t()
+colnames(zrolled) <- c(-100:99)
+
+#altogether raw
+p %>% gather(-gene, -group, -value, -rank, key = bin, value = content)  %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = "U content", xlab = "Position around PAS", ylab = "U Frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = 0.5) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75))
+
+#faceted raw
+p %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(as_tibble(genetypes), by = c("gene" = "Gene")) %>% gather(-gene, -group, -value, -rank,-genetype, key = bin, value = content) %>% filter(genetype != "mixed") %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = "U content", xlab = "Position around PAS", ylab = "U Frequency (%)", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = 0.5) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + facet_wrap(.~genetype, nrow = 2) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+#altogether ds raw
+y_label <- p[,c(2,115:204)] %>% gather(-group, key = bin, value = content) %>% group_by(bin, group) %>% summarize(mean = mean(content), .groups = "drop") %>% pull(mean) %>% max()
+p[,c(2,115:204)] %>% gather(-group, key = bin, value = content) %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = "U content", xlab = "Position downstream of PAS", ylab = "U Frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.01) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90))
+  
+#faceted ds raw
+y_label <- p[,c(1,2,115:204)] %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(as_tibble(genetypes), by = c("gene" = "Gene")) %>% gather(-gene, -group, -genetype, key = bin, value = content) %>% filter(genetype == "TUTR")  %>% group_by(bin, group) %>% summarize(mean = mean(content), .groups = "drop") %>% pull(mean) %>% max()
+colnames(p) <- c("gene", "group","value", "rank", c(-100:99))
+p[,c(1,2,115:204)] %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(as_tibble(genetypes), by = c("gene" = "Gene")) %>% gather(-gene, -group, -genetype, key = bin, value = content) %>% filter(genetype != "mixed") %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = "U content", xlab = "Position downstream of PAS", ylab = "U Frequency (%)", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.01) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90)) + facet_wrap(.~genetype, nrow = 2) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+#altogether rolled
+y_label <- zrolled %>% as_tibble(rownames = "gene") %>% left_join(., p[,1:2]) %>% gather(-gene, -group, key = bin, value = content) %>% group_by(bin, group) %>% summarize(mean = mean(content,na.rm = TRUE), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+t <- zrolled
+colnames(t) <- c(-100:99)
+t %>% as_tibble(rownames = "gene") %>% left_join(., p[,1:2]) %>% gather(-gene, -group, key = bin, value = content) %>% na.omit() %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = "U content rolling average", xlab = "Position around PAS", ylab = "U Frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.01) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75))
+
+#faceted rolled
+y_label <- zrolled %>% as_tibble(rownames = "gene") %>% left_join(., p[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group, -genetype, key = bin, value = content) %>% group_by(bin, group) %>% summarize(mean = mean(content, na.rm = TRUE), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+t <- zrolled
+colnames(t) <- c(-100:99)
+t %>% as_tibble(rownames = "gene") %>% left_join(., p[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group,-genetype, key = bin, value = content) %>% filter(genetype != "mixed") %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = "U content rolling average", xlab = "Position around PAS", ylab = "U Frequency (%)", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.01) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + facet_wrap(.~genetype, nrow = 2) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+#altogether ds rolled
+y_label <- zrolled[,110:200] %>% as_tibble(rownames = "gene") %>% left_join(., p[,1:2]) %>% gather(-gene, -group, key = bin, value = content) %>% group_by(bin, group) %>% summarize(mean = mean(content, na.rm = TRUE), .groups = "drop") %>% pull(mean) %>% max(., na.rm = TRUE)
+t <- zrolled[,110:200]
+colnames(t) <- c(10:100)
+t %>% as_tibble(rownames = "gene") %>% left_join(., p[,1:2]) %>% gather(-gene, -group, key = bin, value = content) %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = "U content rolling average", xlab = "Position downstream of PAS", ylab = "U Frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.01) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(10,30,50,70,90))
+
+#faceted ds rolled
+y_label <- zrolled[,110:200] %>% as_tibble(rownames = "gene") %>% left_join(., p[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group, -genetype, key = bin, value = content) %>% group_by(bin, group) %>% summarize(mean = mean(content, na.rm = TRUE), .groups = "drop") %>% pull(mean) %>% max(na.rm = TRUE)
+t <- zrolled[,110:200]
+colnames(t) <- c(10:100)
+t %>% as_tibble(rownames = "gene") %>% left_join(., p[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group,-genetype, key = bin, value = content) %>% filter(genetype != "mixed") %>% ggline(x = "bin", y = "content", ylab = "U Frequency (%)", color = "group", add = "mean_se", size = 1.5, title = "U content rolling average", xlab = "Position downstream of PAS", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.02) + scale_color_manual(values = c("#cfd0e4", "#ffd866")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + facet_wrap(.~genetype, nrow = 2) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+#plot for Seungjae
+t <- zrolled[,110:200]
+colnames(t) <- c(10:100)
+t %>% as_tibble(rownames = "gene") %>% left_join(., p[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group, -genetype, key = bin, value = content) %>% filter(genetype == "ALE") %>% mutate(group = ifelse(group == "NR", "Bypassed ALE PAS (269)", "Unbypassed ALE PAS (789)")) %>% ggline(x = "bin", y = "content", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human ALE U content", xlab = "position downstream to polyA site", ylab = "U frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.325) + scale_color_manual(values = c("Red", "Blue")) + scale_x_discrete(breaks=c(10,30,50,70,90))
+
+t %>% as_tibble(rownames = "gene") %>% left_join(., p[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group,-genetype, key = bin, value = content) %>% filter(genetype == "TUTR") %>% mutate(group = ifelse(group == "NR", "Bypassed TUTR PAS (706)", "Unbypassed TUTR PAS (1993)")) %>% ggline(x = "bin", y = "content", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human TUTR U content", xlab = "position downstream to polyA site", ylab = "U frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.31) + scale_color_manual(values = c("Red", "Blue")) + scale_x_discrete(breaks=c(10,30,50,70,90))
+
+```

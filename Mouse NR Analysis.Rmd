@@ -1,0 +1,1902 @@
+---
+title: "MouseNRanalysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(cowplot)
+library(ggpubr)
+library(AnnotationDbi)
+library(UpSetR)
+library(BSgenome.Hsapiens.NCBI.GRCh38)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(GenomicFeatures)
+library(RNAreachR)
+library(eulerr)
+library(data.table)
+
+`%out%` <- Negate(`%in%`)
+`%notin%` <- Negate(`%in%`)
+```
+
+```{r, fxs, echo = FALSE}
+get_U <- function(DNAStringSet){
+  U <- data.frame(gene = names(DNAStringSet),
+                   U = Biostrings::letterFrequency(DNAStringSet, "T") / Biostrings::width(DNAStringSet)) %>%
+    dplyr::as_tibble() %>%
+    dplyr::rename(U = T)
+  return(U)
+}
+
+U_compare <- function(caseDNAStringSet, ctrlDNAStringSet){
+
+  if (any(names(caseDNAStringSet) %in% names(ctrlDNAStringSet))){
+    warning("some sequences in case set are also in the control set. This is not recommended.")
+  }
+
+  U_case <- Biostrings::letterFrequency(caseDNAStringSet, "T") / Biostrings::width(caseDNAStringSet)
+  U_ctrl <- Biostrings::letterFrequency(ctrlDNAStringSet, "T") / Biostrings::width(ctrlDNAStringSet)
+  wilcox.p <- wilcox.test(U_case, U_ctrl)$p.value
+  mean_case <- mean(U_case)
+  mean_ctrl <- mean(U_ctrl)
+  mean_FC <- mean_case/mean_ctrl
+  CliffDelta <- effsize::cliff.delta(U_case, U_ctrl)$estimate
+  lowerCD <- effsize::cliff.delta(U_case, U_ctrl)$conf.int[1]
+  upperCD <- effsize::cliff.delta(U_case, U_ctrl)$conf.int[2]
+
+  data.frame(wilcox.p, mean_case, mean_ctrl, mean_FC, CliffDelta, lowerCD, upperCD)
+}
+
+metagene_nt <- function(DNAStringSet1, DNAStringSet2, Nt, grp1, grp2, title){
+  
+  bin10_NtContent <- function(DNAStringset, Nt, x){
+    y <- letterFrequencyInSlidingView(DNAStringset[[x]], 1, Nt)
+    
+    bin_size <- rep(length(y) %/% 10, 10)
+    bin_size <- bin_size + ifelse(1:10 <= length(y) %% 10, 1, 0)
+    
+    bins <- lapply(c(1:10), function(y) rep(y, bin_size[y])) %>% unlist
+    
+    z <- letterFrequencyInSlidingView(DNAStringset[[x]], 1, Nt) %>%
+      as_tibble() %>%
+      dplyr::rename("nt_content" = 1) %>% 
+      mutate(bin = bins) %>%
+      group_by(bin) %>%
+      summarize(content = mean(nt_content, na.rm = TRUE), .groups = "drop")
+  
+    return(z)
+    
+  }
+  
+  m <- c(1:length(DNAStringSet1))
+  list1 <- lapply(m, function(m) bin10_NtContent(DNAStringSet1, Nt, m))
+  one <- bind_rows(list1, .id = "seq") %>% mutate(bin = as.character(bin), group = !!grp1)
+  
+  
+  n <- c(1:length(DNAStringSet2))
+  list2 <- lapply(n, function(n) bin10_NtContent(DNAStringSet2, Nt, n))
+  two <- bind_rows(list2, .id = "seq") %>% mutate(bin = as.character(bin), group = !!grp2)
+
+  y_label <- rbind(one, two) %>% group_by(bin, group) %>% summarize(mean = mean(content), .groups = "drop") %>% pull(mean) %>% max()
+  
+  p <- rbind(one, two) %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = title) + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.02)
+  
+  return(p)
+}
+
+metagene_motif <- function(PWM_list, caseDNAStringSet, ctrlDNAStringSet, grp1, grp2, title){
+
+  case_seq_len <- tibble(gene = names(caseDNAStringSet), width = width(caseDNAStringSet))
+  
+   case_list <- lapply(PWM_list, function(x) lapply(caseDNAStringSet, function(y) matchPWM(x,y) %>% data.frame(start = start(.), end = end(.))))
+  case_df <- case_list %>% 
+    unlist(recursive = FALSE) %>% 
+    bind_rows(., .id = "key") %>% 
+    as_tibble() %>% 
+    dplyr::rename("match" = 2) %>% 
+    separate(key, into = c("motif", "RBP", "gene"), extra = "merge") %>%
+    left_join(., case_seq_len) %>% 
+    mutate(pos = round(((end - start)*0.5) + start), 
+           bin = ifelse(pos > 0 & pos <= round(width/10), "1", 
+                        ifelse(pos > round(width/10) & pos <= round(2*width/10), "2", 
+                               ifelse(pos > round(2*width/10) & pos <= round(3*width/10), "3",
+                                      ifelse(pos > round(3*width/10) & pos <= round(4*width/10), "4",
+                                             ifelse(pos > round(4*width/10) & pos <= round(5*width/10), "5", 
+                                                    ifelse(pos > round(5*width/10) & pos <= round(6*width/10), "6", 
+                                                           ifelse(pos >  round(6*width/10) & pos <=  round(7*width/10), "7",
+                                                                  ifelse(pos > round(7*width/10) & pos <= round(8*width/10), "8", 
+                                                                         ifelse(pos > round(8*width/10) & pos <= round(9*width/10), "9", 
+                                                                                ifelse(pos > round(9*width/10) & pos <= round(10*width/10), "10",""))))))))))) %>%
+    group_by(bin, RBP, gene) %>% 
+    summarize(norm_count = n()/width) %>% 
+    mutate(group := !!grp1)
+  
+   ctrl_seq_len <- tibble(gene = names(ctrlDNAStringSet), width = width(ctrlDNAStringSet))
+
+   ctrl_list <- lapply(PWM_list, function(x) lapply(ctrlDNAStringSet, function(y) matchPWM(x,y) %>% data.frame(start = start(.), end = end(.))))
+  ctrl_df <- ctrl_list %>% 
+    unlist(recursive = FALSE) %>% 
+    bind_rows(., .id = "key") %>% 
+    as_tibble() %>% 
+    dplyr::rename("match" = 2) %>% 
+    separate(key, into = c("motif", "RBP", "gene"), extra = "merge") %>%
+    left_join(., ctrl_seq_len) %>% 
+    mutate(pos = round(((end - start)*0.5) + start), 
+           bin = ifelse(pos > 0 & pos <= round(width/10), "1", 
+                        ifelse(pos > round(width/10) & pos <= round(2*width/10), "2", 
+                               ifelse(pos > round(2*width/10) & pos <= round(3*width/10), "3",
+                                      ifelse(pos > round(3*width/10) & pos <= round(4*width/10), "4",
+                                             ifelse(pos > round(4*width/10) & pos <= round(5*width/10), "5", 
+                                                    ifelse(pos > round(5*width/10) & pos <= round(6*width/10), "6", 
+                                                           ifelse(pos >  round(6*width/10) & pos <=  round(7*width/10), "7",
+                                                                  ifelse(pos > round(7*width/10) & pos <= round(8*width/10), "8", 
+                                                                         ifelse(pos > round(8*width/10) & pos <= round(9*width/10), "9", 
+                                                                                ifelse(pos > round(9*width/10) & pos <= round(10*width/10), "10",""))))))))))) %>%
+    group_by(bin, RBP, gene) %>% 
+    summarize(norm_count = n()/width) %>% 
+    mutate(group := !!grp2)
+    
+  hit_df <- rbind(case_df, ctrl_df)  
+  #y_label <- hit_df %>% group_by(bin, group, RBP) %>% summarize(mean = mean(count), .groups = "drop") %>% pull(mean) %>% max()
+  
+    p <- hit_df %>% ggline(x = "bin", y = "norm_count", color = "group", add = "mean_se", size = 1.5, title = title, facet.by = "RBP", scales = "free_y") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y.npc = 0.15) + scale_x_discrete(limits = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10"))
+ 
+  return(p)
+}
+
+metagene_flank_nt <- function(DNAStringSet1, DNAStringSet2, Nt, grp1, grp2, title){
+  
+  bin10_NtContent <- function(DNAStringset, Nt, x){
+    y <- letterFrequencyInSlidingView(DNAStringset[[x]], 1, Nt)
+    
+    bin_size <- rep(length(y) %/% 11, 11)
+    bin_size <- bin_size + ifelse(1:11 <= length(y) %% 11, 1, 0)
+    
+    bins <- lapply(c(1:11), function(y) rep(y, bin_size[y])) %>% unlist
+    
+    z <- y %>%
+      as_tibble() %>%
+      dplyr::rename("nt_content" = 1) %>% 
+      mutate(bin = bins) %>%
+      group_by(bin) %>%
+      summarize(content = mean(nt_content, na.rm = TRUE), .groups = "drop")
+  
+    return(z)
+    
+  }
+  
+  m <- c(1:length(DNAStringSet1))
+  list1 <- lapply(m, function(m) bin10_NtContent(DNAStringSet1, Nt, m))
+  one <- bind_rows(list1, .id = "seq") %>% mutate(bin = as.character(bin), group = !!grp1)
+  
+  
+  n <- c(1:length(DNAStringSet2))
+  list2 <- lapply(n, function(n) bin10_NtContent(DNAStringSet2, Nt, n))
+  two <- bind_rows(list2, .id = "seq") %>% mutate(bin = as.character(bin), group = !!grp2)
+  
+
+  y_label <- rbind(one, two) %>% group_by(bin, group) %>% summarize(mean = mean(content), .groups = "drop") %>% pull(mean) %>% max()
+  
+  p <- rbind(one, two) %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = title, xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.02) + scale_x_discrete(labels = c("-100", "-80", "-60", "-40", "-20", "0", "20", "40", "60", "80", "100"))
+  
+  return(p)
+}
+
+metagene_flank_motif <- function(PWM_list, caseDNAStringSet, ctrlDNAStringSet, title){
+
+   case_list <- lapply(PWM_list, function(x) lapply(caseDNAStringSet, function(y) matchPWM(x,y) %>% data.frame(start = start(.), end = end(.))))
+  case_df <- case_list %>% 
+    unlist(recursive = FALSE) %>% 
+    bind_rows(., .id = "key") %>% 
+    as_tibble() %>% 
+    dplyr::rename("match" = 2) %>% 
+    separate(key, into = c("motif", "RBP", "gene", "UTR"), extra = "merge") %>%
+    mutate(pos = round(((end - start)*0.5) + start), 
+           bin = ifelse(pos > 0 & pos <= 19, "-100", 
+                        ifelse(pos > 19 & pos <= 38, "-80", 
+                               ifelse(pos > 38 & pos <= 56, "-60",
+                                      ifelse(pos > 56 & pos <= 74, "-40",
+                                             ifelse(pos > 74 & pos <= 92, "-20", 
+                                                    ifelse(pos > 92 & pos <= 110, "0", 
+                                                           ifelse(pos > 110 & pos <= 128, "20",
+                                                                  ifelse(pos > 128 & pos <= 146, "40", 
+                                                                         ifelse(pos > 146 & pos <= 164, "60", 
+                                                                                ifelse(pos > 164 & pos <= 182, "80",
+                                                                                       ifelse(pos > 182 & pos <= 200, "100", "")))))))))))) %>%
+    group_by(bin, RBP, gene) %>% 
+    summarize(count = n()) %>% 
+    mutate(group = "NR")
+  
+   ctrl_list <- lapply(PWM_list, function(x) lapply(ctrlDNAStringSet, function(y) matchPWM(x,y) %>% data.frame(start = start(.), end = end(.))))
+  ctrl_df <- ctrl_list %>% 
+    unlist(recursive = FALSE) %>% 
+    bind_rows(., .id = "key") %>% 
+    as_tibble() %>% 
+    dplyr::rename("match" = 2) %>% 
+    separate(key, into = c("motif", "RBP", "gene", "UTR"), extra = "merge") %>%
+    mutate(pos = round(((end - start)*0.5) + start), 
+           bin = ifelse(pos > 0 & pos <= 19, "-100", 
+                        ifelse(pos > 19 & pos <= 38, "-80", 
+                               ifelse(pos > 38 & pos <= 56, "-60",
+                                      ifelse(pos > 56 & pos <= 74, "-40",
+                                             ifelse(pos > 74 & pos <= 92, "-20", 
+                                                    ifelse(pos > 92 & pos <= 110, "0", 
+                                                           ifelse(pos > 110 & pos <= 128, "20",
+                                                                  ifelse(pos > 128 & pos <= 146, "40", 
+                                                                         ifelse(pos > 146 & pos <= 164, "60", 
+                                                                                ifelse(pos > 164 & pos <= 182, "80",
+                                                                                       ifelse(pos > 182 & pos <= 200, "100", "")))))))))))) %>%
+    group_by(bin, RBP, gene) %>% 
+    summarize(count = n()) %>%
+    mutate(group = "ctrl")
+    
+  hit_df <- rbind(case_df, ctrl_df)  
+  #y_label <- hit_df %>% group_by(bin, group, RBP) %>% summarize(mean = mean(count), .groups = "drop") %>% pull(mean) %>% max()
+  
+    p <- hit_df %>% ggline(x = "bin", y = "count", color = "group", add = "mean_se", size = 1.5, title = title, facet.by = "RBP", scales = "free_y", xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y.npc = 0.07) + scale_x_discrete(labels = c("-100", "-80", "-60", "-40", "-20", "0", "20", "40", "60", "80", "100")) 
+ 
+  return(p)
+}
+
+```
+
+### The goal of this document is to identify genes that preferentially utilize a longer isoform (or more downstream APA) in brain tissues/cells and what sequence characteristics they share.
+
+We are utilizing 2 mouse datasets..
+The first is tissue focused, analyzing the isoform usage in different tissues including brain.
+Here we can identify long isoforms that are heavily used in brain.
+The other experiment is a timecourses across neruonal differentiation from embryonic stem cells.
+We can identify genes that increase in their long isoform usage as they differentiate into neurons. 
+
+To discover these long isoforms preferentially used in brain, I have utilized K-means clustering.
+
+To include the most observations for downstream analyses, I simply combined the gene lists identified via K-means clustering for each dataset.
+
+
+----------------
+
+## Mouse Tissue data Brain <--> (Small Intestine, Liver, Heart)
+
+This data is from "A Comprehensive Mouse Transcriptomic BodyMap across 17 Tissues by RNA-seq" By Li et al in 2017
+
+https://www.nature.com/articles/s41598-017-04520-z
+
+It has many tissues however, Brain was only compared to Small Intestine, Liver and Heart.
+Samples were collected from four mice, 2 male and 2 female.
+
+Below I have averaged the psi values across mice for each gene in each tissue to identify isoforms preferentially used in Brain tissue.
+
+-----------
+
+### We will only consider genes with 2 poly A sites (1 long isoform and 1 short)
+
+```{r, mouse genes with 2 polya sites}
+# mouse gff we will eventually pull sequences from:
+polya_txdb <- loadDb("psidat/twoUTR_polya_mm_gff_txdb.sqlite")
+# 4,554 genes with only two isoforms (short and long)
+mm2UTRids <- names(genes(polya_txdb)) %>% unique()
+
+```
+
+### Reading in LABRAT outputs and tidying them
+
+With the following data, LABRAT was not ran with any replicates.
+Therefore pvalues and FDRs are not especially meaningful.
+These are not needed for identifying genes with brain tissue specific long isoforms.
+
+```{r, mmTissue psi dat, warning = FALSE}
+# just the psi values for each tissue
+mm_psis <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis", header = TRUE)) %>% 
+  dplyr::rename("Brain_F4b" = "Bain_F4b", "Brain_M2b" = "Bain_M2b") %>% # get rid of some typos I made
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% mm2UTRids) # get rid of genes with more than 2 isoforms (56% of genes are kept)
+
+###what are these 2 APA site genes??
+#as_tibble(read.table("psidat/mmTissue/LABRAT.psis", header = TRUE)) %>% 
+#  dplyr::select(Gene, genetype) %>% 
+#  unique() %>% 
+#  group_by(genetype) %>% 
+#  summarize(n = n()) %>% 
+#  arrange(desc(n)) %>% 
+#  mutate(percent = n / sum(n) *100, 
+#         label = paste(genetype, "\n", format(round(percent,1),nsmall = 1), "%", sep = "")) %>%
+#  ggplot(aes(x = "", y = n, fill = genetype)) + 
+#  geom_bar(stat = "identity") + 
+#  coord_polar("y", start = 0) + 
+#  theme_minimal() +
+#  theme(axis.text.x=element_blank(),
+#        panel.border = element_blank(),
+#        panel.grid=element_blank(),
+#        axis.ticks = element_blank(), 
+#        plot.title=element_text(size=14, face="bold")) + 
+#  labs(x = "", y = "", title = "All Tissue Genetypes") +
+#  geom_text(aes(y = n/3 + c(0, cumsum(n)[-length(n)]), label = label), size=5) + 
+#  guides(fill = FALSE) 
+
+all <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis", header = TRUE)) %>% 
+  dplyr::select(Gene, genetype) %>% 
+  unique() %>% 
+  group_by(genetype) %>% 
+  summarize(all = n())
+APA2 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis", header = TRUE)) %>% 
+  dplyr::select(Gene, genetype) %>%
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% 
+  filter(Gene %in% mm2UTRids) %>% 
+  unique() %>% 
+  group_by(genetype) %>% 
+  summarize(APA2 = n())
+APA_more <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis", header = TRUE)) %>% 
+  dplyr::select(Gene, genetype) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% 
+  filter(Gene %notin% mm2UTRids) %>% 
+  unique() %>% 
+  group_by(genetype) %>% 
+  summarize(more_APA = n())
+
+left_join(all,APA_more) %>% left_join(., APA2) %>% 
+    mutate(all = round(all/sum(all)*100,1),
+           more_APA = round(more_APA/sum(more_APA)*100,1),
+           APA2 = round(APA2/sum(APA2)*100,1)) %>% 
+    gather(-genetype, key = group, value = Percent) %>% 
+    mutate(label = paste(genetype, "\n", as.character(Percent), "%", sep = ""),
+           group = ifelse(group == "all", "All Genes\nN=7907", ifelse(group == "APA2", "2 APA\nN=4444", "> 2 APA\nN=3463"))) %>% 
+    ggplot(aes(x = group, y = Percent, fill = genetype)) +
+    geom_bar(stat ="identity") +
+    theme_cowplot() +
+    labs(x = "", title = "Tissue Mouse Genes with and without 2 APA sites") +
+    geom_text(size = 3, position = position_stack(vjust = 0.5), aes(label = label)) +
+    guides(fill = FALSE) +
+    scale_fill_manual(values = c("#fc9867", "#a9dc76", "#78dce8"))
+
+###
+
+
+mm_psis_tidy <- mm_psis %>% 
+  gather(-Gene, -genetype, key = temp, value = psi) %>% 
+  separate(temp, into = c("tissue", "mouse"), sep = "_")
+
+# delta psi values (delta psi = TissueX - Brain)
+# Male mouse 1
+SInt_M1 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_SInt_M1.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "SInt_M1", "Brain" = "Brain_M1a") %>% 
+  mutate(mouse = "M1", tissue = "SInt")
+Heart_M1 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Heart_M1.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Heart_M1", "Brain" = "Brain_M1a") %>% 
+  mutate(mouse = "M1", tissue = "Heart")
+Liver_M1a <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_M1.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Liver_M1a", "Brain" = "Brain_M1a") %>% 
+  mutate(mouse = "M1", tissue = "Liver") %>% 
+  dplyr::select(-Brain_M1b, -Liver_M1b)
+Liver_M1b <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_M1.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Liver_M1b", "Brain" = "Brain_M1b") %>% 
+  mutate(mouse = "M1", tissue = "Liver") %>% 
+  dplyr::select(-Brain_M1a, -Liver_M1a)
+
+# Male mouse 2
+SInt_M2 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_SInt_M2.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "SInt_M2", "Brain" = "Brain_M2a") %>% 
+  mutate(mouse = "M2", tissue = "SInt")
+Heart_M2 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Heart_M2.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Heart_M2", "Brain" = "Brain_M2a") %>% 
+  mutate(mouse = "M2", tissue = "Heart")
+Liver_M2a <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_M2.pval", header = TRUE)) %>%
+  dplyr::rename("Tissue_X" = "Liver_M2a", "Brain" = "Brain_M2a") %>%
+  mutate(mouse = "M2", tissue = "Liver") %>% 
+  dplyr::select(-Bain_M2b, -Liver_M2b)
+Liver_M2b <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_M2.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Liver_M2b", "Brain" = "Bain_M2b") %>% 
+  mutate(mouse = "M2", tissue = "Liver") %>% 
+  dplyr::select(-Brain_M2a, -Liver_M2a)
+
+# Female mouse 3
+SInt_F3 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_SInt_F3.pval", header = TRUE)) %>%
+  dplyr::rename("Tissue_X" = "SInt_F3", "Brain" = "Brain_F3a") %>% 
+  mutate(mouse = "F3", tissue = "SInt")
+Heart_F3 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Heart_F3.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Heart_F3", "Brain" = "Brain_F3a") %>% 
+  mutate(mouse = "F3", tissue = "Heart")
+Liver_F3a <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_F3.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Liver_F3a", "Brain" = "Brain_F3a") %>% 
+  mutate(mouse = "F3", tissue = "Liver") %>% 
+  dplyr::select(-Brain_F3b, -Liver_F3b)
+Liver_F3b <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_F3.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Liver_F3b", "Brain" = "Brain_F3b") %>% 
+  mutate(mouse = "F3", tissue = "Liver") %>% 
+  dplyr::select(-Brain_F3a, -Liver_F3a)
+
+# Female mouse 4
+SInt_F4 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_SInt_F4.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "SInt_F4", "Brain" = "Brain_F4a") %>% 
+  mutate(mouse = "F4", tissue = "SInt")
+Heart_F4 <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Heart_F4.pval", header = TRUE)) %>% 
+  dplyr::rename("Tissue_X" = "Heart_F4", "Brain" = "Brain_F4a") %>%
+  mutate(mouse = "F4", tissue = "Heart")
+Liver_F4a <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_F4.pval", header = TRUE)) %>%
+  dplyr::rename("Tissue_X" = "Liver_F4a", "Brain" = "Brain_F4a") %>%
+  mutate(mouse = "F4", tissue = "Liver") %>% 
+  dplyr::select(-Bain_F4b, -Liver_F4b)
+Liver_F4b <- as_tibble(read.table("psidat/mmTissue/LABRAT.psis.Brain_Liver_F4.pval", header = TRUE)) %>%
+  dplyr::rename("Tissue_X" = "Liver_F4b", "Brain" = "Bain_F4b") %>% 
+  mutate(mouse = "F4", tissue = "Liver") %>% 
+  dplyr::select(-Brain_F4a, -Liver_F4a)
+
+# Collect delta psi (dpsis) for ease
+mm_dpsis <- bind_rows(SInt_M1, Heart_M1, Liver_M1a, Liver_M1b, SInt_M2, Heart_M2, Liver_M2a, Liver_M2b, SInt_F3, Heart_F3, Liver_F3a, Liver_F3b, SInt_F4, Heart_F4, Liver_F4a, Liver_F4b) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% mm2UTRids) # get rid of genes with more than 2 isoforms (56% of genes kept)
+
+```
+
+### Generally, what does this data look like?
+
+```{r, define mouse genes by value, warning = FALSE}
+# Globally, Brain has the highest psi value
+comps <- list(c("Brain", "Heart"), c("Brain", "Liver"), c("Brain", "SInt"))
+mm_psis_tidy %>% mutate(mouse = ifelse(mouse == "F4a" | mouse == "F4b", "F4", 
+                                       ifelse(mouse == "F3a"| mouse == "F3b", "F3", 
+                                              ifelse(mouse == "M1a" | mouse == "M1b", "M1", 
+                                                     ifelse(mouse == "M2a" | mouse == "M2b", "M2", mouse))))) %>% 
+    ggplot(aes(x = tissue, y = psi, fill = "#cfd0e4")) + 
+    geom_point(aes(alpha = 0.1, col = mouse), position = "jitter") + 
+    geom_violin(alpha = 0.65) + 
+    geom_boxplot(width = 0.1) +
+    theme_cowplot() +
+    guides(fill = FALSE, alpha = FALSE) +
+    stat_compare_means(comparisons = comps, method = "wilcox") +
+    labs(x = "", title = "Mouse Tissue Psi Data") +
+    scale_color_manual(values = c("#ff6188", "#fc9867", "#78dce8", "#a9dc76")) +
+    scale_fill_manual(values = "#dddddd")
+
+```
+
+### We define genes with preferential long isoform usage in brain by identifying clusters of genes with shared behaviors
+
+```{r, define mouse genes by trend, warning = FALSE}
+# filter out genes with low std
+filtData <- mm_psis_tidy %>% 
+  group_by(Gene, tissue) %>% 
+  summarise(mean_psi = mean(psi, na.rm = TRUE)) %>% 
+  spread(tissue, mean_psi) %>% 
+  ungroup() %>% 
+  mutate(std = matrixStats::rowSds(as.matrix(.[2:5]))) %>% 
+  filter(std != 0) %>% 
+  dplyr::select(-std)
+
+# log transform data
+clustData <- filtData %>% 
+  select_if(is.numeric) %>%
+  mutate_all(funs(log10(1 + .))) %>%
+  as.matrix()
+
+rownames(clustData) <- filtData$Gene
+
+# scale data
+s_clustData <- t(scale(t(clustData))) 
+
+# kmeans cluster 3 seems cool...
+set.seed(1)
+kclust <- pheatmap::pheatmap(mat = s_clustData,
+                cluster_cols = F,
+                scale = "row",
+                kmeans_k = 6,
+                color = viridis::viridis(20))
+# 405 genes in k3
+mmTissue_genes <- data.frame(Cluster=kclust$kmeans$cluster,
+                          Gene=names(kclust$kmeans$cluster)) %>% 
+  as_tibble() %>% 
+  filter(Cluster == 3) %>% 
+  pull(Gene) %>% 
+  as.character()
+
+```
+
+----------------
+
+## Mouse Embryonic Stem Cell --> Neruonal Time course
+
+This data is from "Longitudinal RNA sequencing of the deep transcriptome during neurogenesis of cortical glutamatergic neurons from murine ESCs" by Hubbard et al in 2013
+
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3829120/
+
+mouse embryonic stem cells were differentiated into neurons 
+RNA sequencing occured in triplicate across 8 timepoints
+Everything is compared to the starting point (mESC) DIVminus8.
+
+Here we will identify genes that change their isoform usage to a longer one as they differentiate into neurons.
+
+----------------
+
+### Reading in LABRAT outputs and tidying them
+Here, we have 3 replicates for each timepoint so LABRAT calculated pvalues and FDRs are useful
+
+```{r, read in mm TC dat, warning = FALSE}
+# just the psi values for each timepoint
+dm4 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIVminus4.pval", header = TRUE))
+d0 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIV0.pval", header = TRUE))
+d1 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIV1.pval", header = TRUE))
+d7 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIV7.pval", header = TRUE))
+d16 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIV16.pval", header = TRUE))
+d21 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIV21.pval", header = TRUE))
+d28 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIV28.pval", header = TRUE))
+
+TC_mm_psis <- bind_rows(dm4, d0, d1, d7, d16, d21, d28) %>% 
+  dplyr::select(-deltapsi, -pval, -FDR) %>% # get rid of pval data for now
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>%  # get rid of decimals in gene IDs
+  filter(Gene %in% mm2UTRids) %>%  # get rid of genes with more than 2 isoforms (42% of genes are kept)
+  unique()
+
+###what are these 2 APA site genes??
+
+all <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIVminus4.pval", header = TRUE)) %>% 
+  dplyr::select(Gene, genetype) %>% 
+  unique() %>% 
+  group_by(genetype) %>% 
+  summarize(all = n())
+APA2 <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIVminus4.pval", header = TRUE)) %>% 
+  dplyr::select(Gene, genetype) %>%
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% 
+  filter(Gene %in% mm2UTRids) %>% 
+  unique() %>% 
+  group_by(genetype) %>% 
+  summarize(APA2 = n())
+APA_more <- as_tibble(read.table("psidat/mmNeurondiff/LABRAT.psis.DIVminus4.pval", header = TRUE)) %>% 
+  dplyr::select(Gene, genetype) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% 
+  filter(Gene %notin% mm2UTRids) %>% 
+  unique() %>% 
+  group_by(genetype) %>% 
+  summarize(more_APA = n())
+
+left_join(all,APA_more) %>% left_join(., APA2) %>% 
+    mutate(all = round(all/sum(all)*100,1),
+           more_APA = round(more_APA/sum(more_APA)*100,1),
+           APA2 = round(APA2/sum(APA2)*100,1)) %>% 
+    gather(-genetype, key = group, value = Percent) %>% 
+    mutate(label = paste(genetype, "\n", as.character(Percent), "%", sep = ""),
+           group = ifelse(group == "all", "All Genes\nN=7485", ifelse(group == "APA2", "2 APA\nN=4489", "> 2 APA\nN=2996"))) %>% 
+    ggplot(aes(x = group, y = Percent, fill = genetype)) +
+    geom_bar(stat ="identity") +
+    theme_cowplot() +
+    labs(x = "", title = "Differentiation Mouse Genes with and without 2 APA sites") +
+    geom_text(size = 3, position = position_stack(vjust = 0.5), aes(label = label)) +
+    guides(fill = FALSE) +
+    scale_fill_manual(values = c("#fc9867", "#a9dc76", "#78dce8"))
+
+###
+  
+TC_mm_psis_tidy <- TC_mm_psis %>% 
+  gather(-Gene, -genetype, key = sample, value = psi) %>% 
+  separate(sample, into = c("day", "rep"))
+
+# delta psi values (delta psi = TimepointX - DIVminus8)
+ddm4 <- dm4 %>% dplyr::select(-contains("Rep")) %>% mutate(sample = "DIVminus4")
+dd0 <- d0 %>% dplyr::select(-contains("Rep")) %>% mutate(sample = "DIV0")
+dd1 <- d1 %>% dplyr::select(-contains("Rep")) %>% mutate(sample = "DIV1")
+dd7 <- d7 %>% dplyr::select(-contains("Rep")) %>% mutate(sample = "DIV7")
+dd16 <- d16 %>% dplyr::select(-contains("Rep")) %>% mutate(sample = "DIV16")
+dd21 <- d21 %>% dplyr::select(-contains("Rep")) %>% mutate(sample = "DIV21")
+dd28 <- d28 %>% dplyr::select(-contains("Rep")) %>% mutate(sample = "DIV28")
+
+TC_mm_dpsis <- bind_rows(ddm4, dd0, dd1, dd7, dd16, dd21, dd28) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% mm2UTRids) # get rid of genes with more than 2 isoforms (60% of genes kept)
+```
+
+### What does this data look like?
+
+```{r, mm TC psideas, warning = FALSE, , fig.width = 25, fig.height = 10}
+# psi values increase over time
+TC_mm_psis_tidy %>% 
+    ggplot(aes(x = factor(day), y = psi, fill = day)) + 
+    geom_violin() + 
+    geom_boxplot(width = 0.1, col = c("#dddddd", "#dddddd", "#dddddd", "#dddddd", "#dddddd", "#dddddd", "#818181", "#818181")) + 
+    scale_x_discrete(limits = c("DIVminus8", "DIVminus4", "DIV0", "DIV1", "DIV7", "DIV16", "DIV21", "DIV28")) +
+    theme_cowplot() + 
+    guides(fill = FALSE) + 
+    theme(text = element_text(size=25), axis.text = element_text(size = 15)) +
+    labs(x = "") +
+    scale_fill_manual(values = c("#365C8DFF", "#277F8EFF", "#4AC16DFF", "#9FDA3AFF", "#FDE725FF", "#1FA187FF", "#46337EFF", "#440154FF"))
+
+# which changes first? TUTRs or ALEs?
+TC_mm_psis_tidy %>% 
+  filter(genetype != "mixed") %>% 
+  ggplot(aes(x = factor(day), y = psi, fill = day)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.1, col = c("#dddddd", "#dddddd", "#dddddd", "#dddddd", "#dddddd", "#dddddd", "#818181", "#818181", "#dddddd", "#dddddd", "#dddddd", "#dddddd", "#dddddd", "#dddddd", "#818181", "#818181")) + 
+  scale_x_discrete(limits = c("DIVminus8", "DIVminus4", "DIV0", "DIV1", "DIV7", "DIV16", "DIV21", "DIV28")) +
+  theme_cowplot() + 
+  guides(fill = FALSE) + 
+  theme(text = element_text(size=25), axis.text = element_text(size = 15)) +
+  labs(x = "") +
+  facet_wrap(.~genetype, nrow = 2)  +
+    scale_fill_manual(values = c("#365C8DFF", "#277F8EFF", "#4AC16DFF", "#9FDA3AFF", "#FDE725FF", "#1FA187FF", "#46337EFF", "#440154FF")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"))
+
+```
+
+```{r, }
+TC_mm_psis_tidy %>% 
+    filter(genetype != "mixed") %>% 
+    ggpubr::ggline(x = "day", y = "psi", color = "genetype", add = "mean_se", size = 1.5, title = "Changes in psi of gene types across timepoints") + 
+    stat_compare_means(aes(group = genetype), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = 0.56) +
+    scale_x_discrete(limits = c("DIVminus8", "DIVminus4", "DIV0", "DIV1", "DIV7", "DIV16", "DIV21", "DIV28")) +
+    scale_color_manual(values = c("#78dce8", "#ff6188"))
+
+```
+
+## Hu Expression across Timecourse
+
+```{r, }
+norm_counts <- read.table(file = "mmNeuronDiff_normcts.txt", header = TRUE)
+ens2gene <- read.table("mm_ens2gene.txt", header= TRUE)
+
+norm_counts %>% 
+  as_tibble(rownames = "ensembl_gene_id") %>% 
+  left_join(., as_tibble(ens2gene)) %>% 
+  dplyr::select(ensembl_gene_id, ext_gene, everything()) %>%
+  filter(grepl(pattern = "Elav", ext_gene)) %>% 
+  gather(-ensembl_gene_id, - ext_gene, key = sample, value = norm_counts) %>% 
+  separate(sample, into = c("Day", "rep")) %>%
+  dplyr::rename("Gene" = ext_gene) %>% 
+  ggpubr::ggline(x = "Day", y = "norm_counts", color = "Gene", add = "mean_se", size = 1.5, title = "Hu Expression across timepoints") + 
+  scale_x_discrete(limits = c("DIVminus8", "DIVminus4", "DIV0", "DIV1", "DIV7", "DIV16", "DIV21", "DIV28")) +
+  scale_color_manual(values = c("#fc9867", "#a9dc76", "#78dce8"))
+```
+
+### We define genes with preferential long isoform usage in brain by identifying clusters of genes with shared behaviors
+
+```{r, mm pheatmap tc, warning = FALSE}
+# filter out genes with low std
+filtData <- TC_mm_psis_tidy %>% 
+  dplyr::select(-genetype) %>% 
+  group_by(Gene, day) %>% 
+  summarize(mean_psi = mean(psi, na.rm = TRUE)) %>% 
+  spread(day, mean_psi) %>% 
+  ungroup() %>% 
+  dplyr::select(Gene, DIVminus8, DIVminus4, DIV0, DIV1, DIV7, DIV16, DIV21, DIV28) %>%
+  mutate(std = matrixStats::rowSds(as.matrix(.[2:9]))) %>% 
+  filter(std != 0) %>% dplyr::select(-std)
+
+# log transform data
+clustData <- filtData %>% 
+  select_if(is.numeric) %>%
+  mutate_all(funs(log10(1 + .))) %>%
+  as.matrix()
+
+rownames(clustData) <- filtData$Gene
+
+# scale data
+s_clustData <- t(scale(t(clustData))) 
+
+#cluster 3 is cool
+set.seed(1)
+TCkclust <- pheatmap::pheatmap(mat = s_clustData, 
+                              kmeans_k = 3, 
+                              cluster_cols = FALSE,
+                              scale = "row", 
+                              color = viridis::viridis(20))
+
+# 968 genes in K3
+mmTC_genes <- data.frame(Cluster=TCkclust$kmeans$cluster,
+                          Gene=names(TCkclust$kmeans$cluster)) %>% 
+  as_tibble() %>% 
+  filter(Cluster == 3) %>% 
+  pull(Gene) %>% 
+  as.character()
+
+```
+
+
+### What genes are shared between each dataset?
+
+```{r, all the genes compared}
+plot(euler(list("Mouse Tissue" = mmTissue_genes, "Mouse Differentiation" = mmTC_genes)), quantities = TRUE)
+
+Tissue <- data.frame(Cluster=kclust$kmeans$cluster,
+                          Gene=names(kclust$kmeans$cluster)) %>% 
+  as_tibble() %>% 
+  filter(Cluster == 3) %>% 
+  left_join(genetypes) %>% 
+  group_by(genetype) %>%
+  na.omit() %>% 
+  summarize(Tissue = n())
+Diff <- data.frame(Cluster=TCkclust$kmeans$cluster,
+                          Gene=names(TCkclust$kmeans$cluster)) %>% 
+  as_tibble() %>% 
+  filter(Cluster == 3) %>% 
+  left_join(genetypes) %>% 
+  group_by(genetype) %>%
+  na.omit() %>% 
+  summarize(Diff = n())
+Both <- data.frame(Cluster=kclust$kmeans$cluster,
+                          Gene=names(kclust$kmeans$cluster)) %>% 
+  as_tibble() %>% 
+  filter(Cluster == 3, Gene %in% mmTC_genes) %>% 
+  left_join(genetypes) %>% 
+  group_by(genetype) %>%
+  na.omit() %>% 
+  summarize(Both = n())
+
+left_join(Tissue,Diff) %>% left_join(., Both) %>% 
+    mutate(Tissue = round(Tissue/sum(Tissue)*100,1),
+           Diff = round(Diff/sum(Diff)*100,1),
+           Both = round(Both/sum(Both)*100,1)) %>% 
+    gather(-genetype, key = group, value = Percent) %>% 
+    mutate(label = paste(genetype, "\n", as.character(Percent), "%", sep = ""),
+           group = ifelse(group == "Both", "Both\nN=273", ifelse(group == "Diff", "Differentiation\nN=967", "Tissue\nN=405"))) %>% 
+    ggplot(aes(x = group, y = Percent, fill = genetype)) +
+    geom_bar(stat ="identity") +
+    theme_cowplot() +
+    labs(x = "", title = "Mouse NR genes from 2 datasets") +
+    geom_text(size = 3, position = position_stack(vjust = 0.5), aes(label = label)) +
+    guides(fill = FALSE) +
+    scale_fill_manual(values = c("#fc9867", "#a9dc76", "#78dce8"))
+
+```
+
+### genes lists for further sequence analysis
+We will create gene lists of interest. 
+We also need to define control gene lists that do not include the above genes yet are expressed in brain.
+
+```{r, gene lists}
+# 3499 genes expressed in either brain tissue or differentiated neurons
+mm_expressed <- unique(c(mm_psis_tidy %>% 
+                           filter(tissue == "Brain") %>% 
+                           na.omit() %>% 
+                           pull(Gene) %>% 
+                           unique(), TC_mm_psis_tidy %>% 
+                                     filter(day == "DIV28") %>%  
+                                     na.omit() %>% 
+                                     pull(Gene) %>% 
+                                     unique()))
+
+# 1100 mouse NR genes, 2329 ctrl genes
+mm_NR_genes <- unique(c(mmTissue_genes, mmTC_genes))
+mm_ctrl_genes <- mm_expressed[mm_expressed %out% mm_NR_genes]
+
+```
+
+### What are these genes?
+
+```{r, GO analysis}
+library(enrichR)
+library(biomaRt)
+
+mmMart <- useMart("ENSEMBL_MART_ENSEMBL",
+                 dataset = "mmusculus_gene_ensembl",
+                 host='www.ensembl.org')
+
+dbs <- listEnrichrDbs()
+dbs <- c("GO_Molecular_Function_2018", "GO_Cellular_Component_2018", "GO_Biological_Process_2018" , "ChEA_2016" ,"KEGG_2019_Human")
+
+mm_gene_name <- getBM(attributes=c('ensembl_gene_id',
+                   'external_gene_name'),
+      filters = "ensembl_gene_id",
+      values = mm_NR_genes,
+      mart = mmMart) %>% pull(., external_gene_name)
+
+mm_genes <- enrichr(mm_gene_name, dbs)
+
+
+mm_genes[["GO_Biological_Process_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+mm_genes[["GO_Cellular_Component_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+mm_genes[["GO_Molecular_Function_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+
+```
+
+## Extract UTR sequences for genes of interest
+The first step is to load txdb objects containing unique UTR coordinates of genes with two isoforms (long and short). Matt Taliaferro has has generated these for both mouse and human.
+If the UTRs contain overlapping sequence (tandem UTRs), this sequence is only represented in the shorter isoform. The longer isoform has only the extended, unique sequence.
+
+```{r, }
+mmpolya_txdb <- AnnotationDbi::loadDb("psidat/twoUTR_polya_mm_gff_txdb.sqlite")
+genetypes <- read.table("psidat/mouse_genetype_table.txt", header = TRUE)
+
+# appending text to gene names to interface with txdb objects easily
+mm_prox_genes <- unlist(lapply(mm_NR_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+mm_dist_genes <- unlist(lapply(mm_NR_genes, function(x) paste(x, "_uniqueUTR1", sep = "")))
+mm_ctrl_prox_genes <- unlist(lapply(mm_ctrl_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+mm_ctrl_dist_genes <- unlist(lapply(mm_ctrl_genes, function(x) paste(x, "_uniqueUTR1", sep = "")))
+
+export_seqs <- function(tx_list, file_name, species){
+  
+  if (species == "mm"){
+    
+    tx_gff <- exonsBy(mmpolya_txdb, "tx", use.names = TRUE)
+    tx_gff <- tx_gff[names(tx_gff) %in% tx_list]
+    seq <- extractTranscriptSeqs(Mmusculus, tx_gff)
+    
+  } else if (species == "hs"){
+    
+    tx_gff <- exonsBy(hspolya_txdb, "tx", use.names = TRUE)
+    tx_gff <- tx_gff[names(tx_gff) %in% tx_list]
+    seq <- extractTranscriptSeqs(Hsapiens, tx_gff)
+  
+  }
+  
+  writeXStringSet(seq, paste(file_name, ".fa", sep = ""), format = "fasta")
+  rtracklayer::export(tx_gff, paste(file_name, ".gff3", sep = ""), format = "GFF3")
+}
+
+export_seqs(mm_prox_genes, "psidat/fastas/mm_NR_proximal_UTRs", "mm")
+export_seqs(mm_dist_genes, "psidat/fastas/mm_NR_distal_UTRs", "mm")
+export_seqs(mm_ctrl_prox_genes, "psidat/fastas/mm_ctrl_proximal_UTRs", "mm")
+export_seqs(mm_ctrl_dist_genes, "psidat/fastas/mm_ctrl_distal_UTRs", "mm")
+
+mm_prox <- readDNAStringSet("psidat/fastas/mm_NR_proximal_UTRs.fa")
+mm_dist <- readDNAStringSet("psidat/fastas/mm_NR_distal_UTRs.fa")
+mm_ctrl_prox <- readDNAStringSet("psidat/fastas/mm_ctrl_proximal_UTRs.fa")
+mm_ctrl_dist <- readDNAStringSet("psidat/fastas/mm_ctrl_distal_UTRs.fa")
+
+```
+
+## Length
+
+```{r, length prox v dist}
+# mm prox v dist
+mm_length <- get_length(mm_prox) %>% 
+  mutate(gene = substr(gene, 1, 18)) %>% 
+  dplyr::rename("Proximal" = length) %>% 
+  mutate(Distal = get_length(mm_dist)$length) %>% 
+  gather(-gene, key = UTR, value = length)
+
+mm_length_compare <- length_compare(mm_prox, mm_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+mm_length_compare
+
+# mm ctrl prox v dist
+mm_ctrl_length <- get_length(mm_ctrl_prox) %>% 
+  mutate(gene = substr(gene, 1, 18)) %>% 
+  dplyr::rename("Proximal" = length) %>% 
+  mutate(Distal = get_length(mm_ctrl_dist)$length) %>% 
+  gather(-gene, key = UTR, value = length)
+
+mm_ctrl_length_compare <- length_compare(mm_ctrl_prox, mm_ctrl_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+mm_ctrl_length_compare
+
+# all together now
+all_length_compare <- rbind(mm_length_compare, mm_ctrl_length_compare) %>% 
+  as_tibble() %>% 
+  mutate(group = c("NR", "Control"))
+
+all_length_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(all_length_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("NR", "Control")) + 
+  labs(title = "Length of UTRs (Proximal/Distal)",subtitle = "Distal UTRs are always longer than Proximal UTRs, \nEspecially so in NR genes", x = "", y = "Cliff's Delta \n (proximal / distal)")
+
+all_len <- mm_length %>% 
+  dplyr::rename("NR" = length) %>% 
+  full_join(., mm_ctrl_length) %>% 
+  dplyr::rename("Control" = length) %>% 
+  gather(-gene, -UTR, key = group, value = length) %>% 
+  na.omit() %>% 
+  left_join(., genetypes, by = c("gene" = "Gene"))
+
+all_len %>% ggplot(aes(x = factor(UTR, levels = c("Proximal", "Distal")), y = length, fill = factor(UTR, levels = c("Proximal", "Distal")))) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  stat_compare_means(method = "wilcox.test") +
+  scale_y_continuous(limits = c(0, 7500)) + 
+  facet_grid(.~factor(group, levels = c("NR", "Control"))) +
+  guides(fill = FALSE) +
+  labs(x = "UTR", title = "Length of UTRs",subtitle = "Distal UTRs are always longer than Proximal UTRs") +
+  scale_fill_manual(values = c("#78dce8", "#fc9867")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+# what about UTR types??
+
+all_len %>% filter(genetype != "mixed") %>% 
+  ggplot(aes(x = factor(UTR, levels = c("Proximal", "Distal")), y = length, fill = factor(UTR, levels = c("Proximal", "Distal")))) +
+  geom_point(position = "jitter", alpha = 0.25) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(genetype~factor(group, levels = c("NR", "Control"))) +
+  EnvStats::stat_n_text(y.pos = 6750) + 
+  stat_compare_means(method = "wilcox.test", label.y = 7250) +
+  guides(fill = FALSE) +
+  labs(x = "", title = "UTR length by type", subtitle = "Distal ALE and TUTRs are longer than proximal") +
+  coord_cartesian(ylim = c(0,7500)) +
+  scale_fill_manual(values = c("#78dce8", "#fc9867")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"),
+        strip.text.y = element_text(size = 12, color = "Black", face = "bold"))
+
+
+
+all_len  %>% 
+    ggplot(aes(x = factor(group, levels = c("NR", "Control")), y = length, fill = factor(group, levels = c("NR", "Control")))) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() +
+    scale_y_continuous(limits = c(0, 7500)) + 
+    facet_grid(.~factor(UTR, levels = c("Proximal", "Distal"))) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "UTR length", subtitle = "Distal UTRs are longer than expected") +
+    scale_fill_manual(values = c("#ffd866", "#cfd0e4")) +
+    theme(strip.background = element_rect(color = "white", fill = "white"),
+          strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+all_len %>% filter(genetype != "mixed") %>% 
+    ggplot(aes(x = factor(group, levels = c("NR", "Control")), y = length, fill = factor(group, levels = c("NR", "Control")))) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() +
+    scale_y_continuous(limits = c(0, 7500)) + 
+    facet_grid(genetype~ factor(UTR, levels = c("Proximal", "Distal"))) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "UTR length by type", subtitle = "Both Distal ALE and TUTRs are longer than expected") +
+    scale_fill_manual(values = c("#ffd866", "#cfd0e4")) +
+    theme(strip.background = element_rect(color = "white", fill = "white"),
+          strip.text.x = element_text(size = 12, color = "Black", face = "bold"),
+          strip.text.y = element_text(size = 12, color = "Black", face = "bold"))
+
+# distal UTRs
+
+mm_prox_length <- length_compare(mm_prox, mm_ctrl_prox) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl,"NR/ctrl" = mean_FC)
+mm_prox_length
+mm_dist_length <- length_compare(mm_dist, mm_ctrl_dist) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl, "NR/ctrl" =  mean_FC)
+mm_dist_length
+
+UTR_length_compare <- rbind(mm_prox_length, mm_dist_length) %>% 
+  as_tibble() %>% 
+  mutate(group = c("Proximal", "Distal"))
+
+UTR_length_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(all_length_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("Proximal", "Distal")) + 
+  labs(title = "Length of UTRs (NR/Control)", subtitle = "Distal UTRs are longer than expected in NR genes", x = "", y = "Cliff's Delta \n (NR / ctrl)")
+
+```
+
+## Length Summary
+
+Generally, Proximal UTRs are shorter than Distal UTRs. This is very expected.
+However, NR genes have longer Distal UTRs than control genes.
+No trend is seen with proximal UTR length.
+Longer distal UTRs in NR genes is not driven by any specific UTR type (ALE or TUTR)
+
+## GC Content
+
+```{r, GC prox v dist}
+# mm prox v dist
+mm_GC<- get_GC(mm_prox) %>% 
+  mutate(gene = substr(gene, 1, 18)) %>% 
+  dplyr::rename("Proximal" = GC) %>% 
+  mutate(Distal = get_GC(mm_dist)$GC) %>% 
+  gather(-gene, key = UTR, value = GC)
+
+mm_GC_compare <- GC_compare(mm_prox, mm_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+mm_GC_compare
+
+# mm ctrl prox v dist
+mm_ctrl_GC <- get_GC(mm_ctrl_prox) %>% 
+  mutate(gene = substr(gene, 1, 18)) %>% 
+  dplyr::rename("Proximal" = GC) %>% 
+  mutate(Distal = get_GC(mm_ctrl_dist)$GC) %>% 
+  gather(-gene, key = UTR, value = GC)
+
+mm_ctrl_GC_compare <- GC_compare(mm_ctrl_prox, mm_ctrl_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+mm_ctrl_GC_compare
+
+# all together now
+all_GC_compare <- rbind(mm_GC_compare, mm_ctrl_GC_compare) %>% 
+  as_tibble() %>% 
+  mutate(group = c("NR", "Control"))
+
+all_GC_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(all_GC_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("NR", "Control")) + 
+  labs(title = "GC content of UTRs (Proximal/Distal)",subtitle = "Proximal UTRs are more GC rich than Distal UTRs \nThis is not observed for NR genes", x = "", y = "Cliff's Delta \n (proximal / distal)")
+
+all_GC <- mm_GC %>% 
+  dplyr::rename("NR" = GC) %>% 
+  full_join(., mm_ctrl_GC) %>% 
+  dplyr::rename("Control" = GC) %>% 
+  gather(-gene, - UTR, key = group, value = GC) %>% 
+  left_join(., genetypes, by = c("gene" = "Gene")) %>% 
+  na.omit()
+
+all_GC %>% ggplot(aes(x = factor(UTR, levels = c("Proximal", "Distal")), y = GC, fill = factor(UTR, levels = c("Proximal", "Distal")))) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  stat_compare_means(method = "wilcox.test") + 
+  facet_grid(.~factor(group, levels = c("NR", "Control"))) +
+  guides(fill = FALSE) +
+  labs(x = "UTR", title = "GC content of UTRs",subtitle = "Proximal and Distal UTRs of NR genes do not differ in GC content as expected")  +
+  scale_fill_manual(values = c("#78dce8", "#fc9867")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold")) 
+
+# what about UTR types??
+
+all_GC %>% filter(genetype != "mixed") %>% 
+  ggplot(aes(x = factor(UTR, levels = c("Proximal", "Distal")), y = GC, fill = factor(UTR, levels = c("Proximal", "Distal")))) +
+  geom_point(position = "jitter", alpha = 0.25) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(genetype~factor(group, levels = c("NR", "Control"))) +
+  EnvStats::stat_n_text() + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(x = "", title = "GC content of UTRs by type", subtitle = "TUTRs drive higher GC content in Proximal UTRs \nHowever, ALEs do not fit this trend") +
+  scale_fill_manual(values = c("#78dce8", "#fc9867")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"),
+        strip.text.y = element_text(size = 12, color = "Black", face = "bold"))
+
+all_GC %>% filter(genetype != "mixed") %>% 
+  ggplot(aes(x = factor(group, levels = c("NR", "Control")), y = GC, fill = factor(group, levels = c("NR", "Control")))) +
+  geom_point(position = "jitter", alpha = 0.25) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(genetype~factor(UTR, levels = c("Proximal", "Distal"))) +
+  EnvStats::stat_n_text() + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(x = "", title = "GC content of UTRs by type", subtitle = "Proximal UTRs have lower GC content in NR genes than expected") +
+  scale_fill_manual(values = c("#ffd866", "#cfd0e4")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"),
+        strip.text.y = element_text(size = 12, color = "Black", face = "bold"))
+
+
+all_GC  %>% 
+    ggplot(aes(x = factor(group, levels = c("NR", "Control")), y = GC, fill = factor(group, levels = c("NR", "Control")))) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() + 
+    facet_grid(.~factor(UTR, levels = c("Proximal", "Distal"))) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "UTR GC content", subtitle = "Proximal UTRs of NR genes have lower GC content than expected") +
+  scale_fill_manual(values = c("#ffd866", "#cfd0e4")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+all_GC %>% filter(genetype != "mixed") %>% 
+    ggplot(aes(x = factor(group, levels = c("NR", "Control")), y = GC, fill = factor(group, levels = c("NR", "Control")))) +
+    geom_point(position = "jitter", alpha = 0.25) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() + 
+    facet_grid(genetype~ factor(UTR, levels = c("Proximal", "Distal"))) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    EnvStats::stat_n_text() +
+    labs(x = "", title = "GC content of UTRs by type", subtitle = "Proximal TUTRs and ALEs have lower GC content than expected") +
+  scale_fill_manual(values = c("#ffd866", "#cfd0e4")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"),
+        strip.text.y = element_text(size = 12, color = "Black", face = "bold"))
+
+
+mm_prox_GC <- GC_compare(mm_prox, mm_ctrl_prox) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl,"NR/ctrl" = mean_FC)
+mm_prox_GC
+mm_dist_GC <- GC_compare(mm_dist, mm_ctrl_dist) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl, "NR/ctrl" =  mean_FC)
+mm_dist_GC
+
+UTR_GC_compare <- rbind(mm_prox_GC, mm_dist_GC) %>% 
+  as_tibble() %>% 
+  mutate(group = c("Proximal", "Distal"))
+
+UTR_GC_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(all_GC_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("Proximal", "Distal")) + 
+  labs(title = "GC of UTRs (NR/ctrl)", subtitle = "Proximal UTRs are GC poor in NR genes", x = "", y = "Cliff's Delta \n (NR / ctrl)")
+
+```
+
+## GC Content Summary
+
+For most genes, proximal UTRs are more GC rich than distal UTRs
+The opposite trend is seen for NR genes (Distal UTRs are more GC rich than proximal) however, this isnt significant.
+Proximal UTRs of NR genes have significantly lower GC content than expected. 
+The Distal UTRs of NR genes are not very different in GC content from ctrl genes.
+All Proximal UTR types of NR genes contribute to GC poorness.
+
+Are NR proximal UTRs GC poor because they are U rich??
+
+## U Content
+
+```{r, U prox v dist}
+# mm prox v dist
+mm_U <- get_U(mm_prox) %>% 
+  mutate(gene = substr(gene, 1, 18)) %>% 
+  dplyr::rename("Proximal" = U) %>% 
+  mutate(Distal = get_U(mm_dist)$U) %>% 
+  gather(-gene, key = UTR, value = U)
+
+mm_U_compare <- U_compare(mm_prox, mm_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+mm_U_compare
+
+# mm ctrl prox v dist
+mm_ctrl_U <- get_U(mm_ctrl_prox) %>% 
+  mutate(gene = substr(gene, 1, 18)) %>% 
+  dplyr::rename("Proximal" = U) %>% 
+  mutate(Distal = get_U(mm_ctrl_dist)$U) %>% 
+  gather(-gene, key = UTR, value = U)
+
+mm_ctrl_U_compare <- U_compare(mm_ctrl_prox, mm_ctrl_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+mm_ctrl_U_compare
+
+# all together now
+all_U_compare <- rbind(mm_U_compare, mm_ctrl_U_compare) %>% 
+  as_tibble() %>% 
+  mutate(group = c("NR", "Control"))
+
+all_U_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(all_U_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("NR", "Control")) + 
+  labs(title = "U content of UTRs (Proximal/Distal)", subtitle = "Proximal UTRs contain less Us than Distal UTRs", x = "", y = "Cliff's Delta \n (proximal / distal)")
+
+all_U <- mm_U %>% 
+  dplyr::rename("NR" = U) %>% 
+  full_join(., mm_ctrl_U) %>% 
+  dplyr::rename("Control" = U) %>% 
+  gather(-gene, - UTR, key = group, value = U) %>% 
+  left_join(., genetypes, by = c("gene" = "Gene")) %>% 
+  na.omit()
+
+all_U %>% ggplot(aes(x = factor(UTR, levels = c("Proximal", "Distal")), y = U, fill = factor(UTR, levels = c("Proximal", "Distal")))) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  stat_compare_means(method = "wilcox.test") + 
+  facet_grid(.~factor(group, levels = c("NR", "Control"))) +
+  guides(fill = FALSE) +
+  labs(x = "UTR", title = "U content of UTRs",subtitle = "Proximal UTRs have lower U content than Distal UTRs") +
+  scale_fill_manual(values = c("#78dce8", "#fc9867")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+# what about UTR types??
+
+all_U %>% filter(genetype != "mixed") %>% 
+  ggplot(aes(x = factor(UTR, levels = c("Proximal", "Distal")), y = U, fill = factor(UTR, levels = c("Proximal", "Distal")))) +
+  geom_point(position = "jitter", alpha = 0.25) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(genetype~factor(group, levels = c("NR", "Control"))) +
+  EnvStats::stat_n_text() + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(x = "", title = "UTR U content by type", subtitle = "ALE and TUTRs do not share the same U content trends between proximal and distal UTRs") +
+  scale_fill_manual(values = c("#78dce8", "#fc9867")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"),
+        strip.text.y = element_text(size = 12, color = "Black", face = "bold"))
+
+all_U %>% filter(genetype != "mixed") %>% 
+  ggplot(aes(x = factor(group, levels = c("NR", "Control")), y = U, fill = factor(group, levels = c("NR", "Control")))) +
+  geom_point(position = "jitter", alpha = 0.25) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(genetype~factor(UTR, levels = c("Proximal", "Distal"))) +
+  EnvStats::stat_n_text() + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(x = "", title = "UTR U content by type", subtitle = "In every case, NR genes have higher U content than expected") +
+  scale_fill_manual(values = c("#ffd866", "#cfd0e4")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"),
+        strip.text.y = element_text(size = 12, color = "Black", face = "bold"))
+
+
+all_U  %>% 
+    ggplot(aes(x = factor(group, levels = c("NR", "Control")), y = U, fill = factor(group, levels = c("NR", "Control")))) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() + 
+    facet_grid(.~factor(UTR, levels = c("Proximal", "Distal"))) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "UTR U content", subtitle = "NR genes have higher U content than expected") +
+    scale_fill_manual(values = c("#ffd866", "#cfd0e4")) +
+    theme(strip.background = element_rect(color = "white", fill = "white"),
+          strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+all_U %>% filter(genetype != "mixed") %>% 
+    ggplot(aes(x = factor(group, levels = c("NR", "Control")), y = U, fill = factor(group, levels = c("NR", "Control")))) +
+    geom_point(position = "jitter", alpha = 0.25) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() +
+    EnvStats::stat_n_text() +
+    facet_grid(genetype~ factor(UTR, levels = c("Proximal", "Distal"))) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "UTR U content", subtitle = "NR genes have higher U content than expected") +
+    scale_fill_manual(values = c("#ffd866", "#cfd0e4")) +
+    theme(strip.background = element_rect(color = "white", fill = "white"),
+          strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+
+mm_prox_U <- U_compare(mm_prox, mm_ctrl_prox) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl,"NR/ctrl" = mean_FC)
+mm_prox_U
+mm_dist_U <- U_compare(mm_dist, mm_ctrl_dist) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl, "NR/ctrl" =  mean_FC)
+mm_dist_U
+
+UTR_U_compare <- rbind(mm_prox_U, mm_dist_U) %>% 
+  as_tibble() %>% 
+  mutate(group = c("Proximal", "Distal"))
+
+UTR_U_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(all_U_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("Proximal", "Distal")) + 
+  labs(title = "U content of UTRs (NR/ctrl)", subtitle = "NR genes have higher U content especially in proximal UTRs", x = "", y = "Cliff's Delta \n (NR / ctrl)")
+
+```
+
+## U content across UTRs
+
+```{r, U content metagene}
+# all UTR types together
+metagene_nt(mm_prox, mm_dist, "T", "Proximal", "Distal", "Mouse NR UTR U Content") + scale_color_manual(values = c("#fc9867", "#78dce8"))
+
+metagene_nt(mm_prox, mm_ctrl_prox, "T", "NR", "ctrl", "Mouse NRvCtrl Proximal UTR T Content") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+metagene_nt(mm_dist, mm_ctrl_dist, "T", "NR", "ctrl", "Mouse NRvCtrl Distal UTR T Content") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+
+#Tandem
+metagene_nt(mm_prox[names(mm_prox)[names(mm_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_prox[names(mm_ctrl_prox)[names(mm_ctrl_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Mouse  Proximal TUTR T Content") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+metagene_nt(mm_dist[names(mm_dist)[names(mm_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], mm_ctrl_dist[names(mm_ctrl_dist)[names(mm_ctrl_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Mouse NRvCtrl Distal TUTR T Content") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+
+#ALEs
+metagene_nt(mm_prox[names(mm_prox)[names(mm_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_prox[names(mm_ctrl_prox)[names(mm_ctrl_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Mouse  Proximal ALE T Content") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+metagene_nt(mm_dist[names(mm_dist)[names(mm_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], mm_ctrl_dist[names(mm_ctrl_dist)[names(mm_ctrl_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Mouse NRvCtrl Distal ALE T Content") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+```
+
+
+
+## U content Summary
+Normally, distal UTRs contain more Us than proximal But this trend is not true for NR genes.
+Proximal UTRs of NR genes contain more Us than expected. 
+
+Additionally, Distal UTRs of NR genes seem to have much higher U content at the beginning of the distal UTR
+This is only seen with Tandem UTRs.
+ALEs dont show much difference in U content and certainly don't display the same U spike
+However, there may still be U spikes immediately downstream of Proximal ALE PAS but it is not captured here because that sequence is intronic and not part of any UTRs
+
+## Kmer enrichment
+
+```{r, kmer}
+######################
+# mm prox v dist
+mm_kmer <- kmer_compare(mm_prox, mm_dist, 6) %>% 
+  dplyr::rename("dist" = ctrl, "prox" = case, "dist_freq" = ctrl_freq, "prox_freq" = case_freq, "dist_tot" = ctrl_tot, "prox_tot" = case_tot)
+mm_kmer %>% dplyr::rename("log2(prox/dist)" = log2FC)
+kmer_plot(mm_kmer) + labs(x = "log2(prox/dist)", title = "NR (prox v dist)")
+
+# mm_ctrl prox v dist
+mm_ctrl_kmer <- kmer_compare(mm_ctrl_prox, mm_ctrl_dist, 6) %>% 
+  dplyr::rename("dist" = ctrl, "prox" = case, "dist_freq" = ctrl_freq, "prox_freq" = case_freq, "dist_tot" = ctrl_tot, "prox_tot" = case_tot)
+mm_ctrl_kmer %>% dplyr::rename("log2(prox/dist)" = log2FC)
+kmer_plot(mm_ctrl_kmer) + labs(x = "log2(prox/dist)", title = "Control (prox v dist)")
+
+#####################
+
+# mm NR v ctrl
+mm_prox_kmer <- kmer_compare(mm_prox, mm_ctrl_prox, 6) 
+mm_prox_kmer 
+kmer_plot(mm_prox_kmer) + labs(x = "log2(NR/ctrl)", title = "Proximal UTRs (NR v ctrl)")
+
+mm_dist_kmer <- kmer_compare(mm_dist, mm_ctrl_dist, 6) 
+mm_dist_kmer 
+kmer_plot(mm_dist_kmer) + labs(x = "log2(NR/ctrl)", title = "Distal UTRs (NR v ctrl)")
+
+
+
+```
+
+```{r,}
+all_kmer <- list(mm_prox_kmer, mm_dist_kmer)
+names(all_kmer) <- c("prox", "dist")
+all_kmer <- bind_rows(all_kmer, .id = "UTR")
+
+# combine all kmers found to be enriched in any (mm, hs, cs) NR v ctrl comparison
+
+prox_enr <- all_kmer %>% filter(UTR == "prox", log2FC > 0, p_adj < 0.05) %>% group_by(kmer) %>% summarize(n=n()) %>% arrange(desc(n)) %>% pull(kmer) %>% as.character() %>% unique()
+prox_dep <- all_kmer %>% filter(UTR == "prox", log2FC < 0, p_adj < 0.05) %>% group_by(kmer) %>% summarize(n=n()) %>% arrange(desc(n)) %>% pull(kmer) %>% as.character() %>% unique()
+dist_enr <- all_kmer %>% filter(UTR == "dist", log2FC > 0, p_adj < 0.05) %>% group_by(kmer) %>% summarize(n=n()) %>% arrange(desc(n)) %>% pull(kmer) %>% as.character() %>% unique()
+dist_dep <- all_kmer %>% filter(UTR == "dist", log2FC < 0, p_adj < 0.05) %>% group_by(kmer) %>% summarize(n=n()) %>% arrange(desc(n)) %>% pull(kmer) %>% as.character() %>% unique()
+
+
+upset_dat <-list(prox_enr = prox_enr, prox_dep = prox_dep, dist_enr = dist_enr, dist_dep = dist_dep)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+
+```
+
+
+## Kmer enrichment Summary 
+
+```{r, fid.width = 20}
+
+kmer2logo(prox_enr[prox_enr %notin% dist_dep], "kmers enriched in proximal UTRs")
+kmer2PWM(prox_dep[prox_dep %notin% dist_dep]) %>% ggseqlogo::ggseqlogo(method = "prob") + ggtitle("kmers depleted in proximal UTRs")
+kmer2logo(prox_dep[prox_dep %in% dist_dep], "kmers generally depleted from NR genes")
+kmer2logo(dist_enr, "kmers enriched in distal UTRs")
+kmer2logo(dist_dep[dist_dep %notin% prox_dep], "kmers depleted in distal UTRs")
+
+```
+
+## Motif enrichment
+Two Motif databases are utilized, CisbpRNA motifs and RNA Bind n Seq motifs
+
+```{r, motif}
+# mm NR v ctrl
+#mm_prox_cisbpRNA <- motif_compare(CISBPRNA_mm_PWM, mm_prox, mm_ctrl_prox)
+#saveRDS(mm_prox_cisbpRNA, "psidat/motif_stats/mm_prox_cisbpRNA.txt") 
+mm_prox_cisbpRNA <- readRDS("psidat/motif_stats/mm_prox_cisbpRNA.txt") 
+mm_prox_cisbpRNA <- mm_prox_cisbpRNA %>% separate(motif, into = c("ID", "temp", "motif"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")
+mm_prox_cisbpRNA
+motif_plot(mm_prox_cisbpRNA) + labs(x = "log2(NR/ctrl)", title = "CisbpRNA Motifs of Proximal UTRs NR v ctrl")
+
+#mm_dist_cisbpRNA <- motif_compare(CISBPRNA_mm_PWM, mm_dist, mm_ctrl_dist)  
+#saveRDS(mm_dist_cisbpRNA, "psidat/motif_stats/mm_dist_cisbpRNA.txt")
+mm_dist_cisbpRNA <- readRDS("psidat/motif_stats/mm_dist_cisbpRNA.txt")
+mm_dist_cisbpRNA <- mm_dist_cisbpRNA %>% separate(motif, into = c("ID", "temp", "motif"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")
+mm_dist_cisbpRNA
+motif_plot(mm_dist_cisbpRNA) + labs(x = "log2(NR/ctrl)", title = "CisbpRNA Motifs of Distal UTRs NR v ctrl")
+
+###############
+
+# mm NR v ctrl
+#mm_prox_RBNS <- motif_compare(RBNS_PWM, mm_prox, mm_ctrl_prox) 
+#saveRDS(mm_prox_RBNS, "psidat/motif_stats/mm_prox_RBNS.txt")
+mm_prox_RBNS <- readRDS("psidat/motif_stats/mm_prox_RBNS.txt")
+mm_prox_RBNS <- mm_prox_RBNS %>% separate(motif, into = c("motif", "ID", "temp"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")
+mm_prox_RBNS 
+motif_plot(mm_prox_RBNS) + labs(x = "log2(NR/ctrl)", title = "RBNS Motifs of Proximal UTRs NR v ctrl")
+
+#mm_dist_RBNS  <- motif_compare(RBNS_PWM, mm_dist, mm_ctrl_dist) 
+#saveRDS(mm_dist_RBNS, "psidat/motif_stats/mm_dist_RBNS.txt")
+mm_dist_RBNS <- readRDS("psidat/motif_stats/mm_dist_RBNS.txt")
+mm_dist_RBNS <- mm_dist_RBNS %>% separate(motif, into = c("motif", "ID", "temp"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")  
+mm_dist_RBNS
+motif_plot(mm_dist_RBNS) + labs(x = "log2(NR/ctrl)", title = "RBNS Motifs of Distal UTRs NR v ctrl")
+ 
+```
+
+
+```{r, }
+all_cisbpRNA <- list(mm_prox_cisbpRNA, mm_dist_cisbpRNA)
+names(all_cisbpRNA) <- c("mm_prox_cisbpRNA", "mm_dist_cisbpRNA")
+all_cisbpRNA <- bind_rows(all_cisbpRNA, .id = "sample") %>% separate(sample, into = c("species", "UTR", "cisbpRNA"), sep = "_") %>% mutate(motif = toupper(motif)) %>% ungroup()
+
+# combine RBPs identified in at least 2 of mm, hs, cs (NR vs ctrl) comparisons
+
+prox_enr <- all_cisbpRNA %>% filter(UTR == "prox", log2FC > 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+prox_dep <- all_cisbpRNA %>% filter(UTR == "prox", log2FC < 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+dist_enr <- all_cisbpRNA %>% filter(UTR == "dist", log2FC > 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+dist_dep <- all_cisbpRNA %>% filter(UTR == "dist", log2FC < 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+
+upset_dat <-list(prox_enr = prox_enr, prox_dep = prox_dep, dist_enr = dist_enr, dist_dep = dist_dep)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+
+```
+
+## CisbpRNA Motif enrichment Summary
+
+Generally depleted from NR transcripts (proximal and distal UTRs):
+
+"SRSF10" "CNOT4"  "RBMX"   "HNRNPL" "PCBP4"
+
+Generally enriched for NR transcripts (proximal and distal UTRs):
+
+"ELAVL3" "PUM1"   "CPEB4"  "RALY"   "TIAL1" 
+
+RBPs enriched in Distal NR UTRs:
+
+"CELF4" "A1CF"  "MBNL2" "MSI1"  "RBM24" "SF3B4" "U2AF2"
+ 
+RBPs depleted in Distal NR UTRs:
+
+"PABPC4"  "IGF2BP1" "KHDRBS3" "SRSF3"   "SYNCRIP" 
+
+RBPs enriched in Proximal NR UTRs:
+
+"KHDRBS3" "PABPC4" 
+
+RBPs depleted in Proximal NR UTRs:
+
+"SRSF1" "EIF4B" "RBM5"
+
+```{r, }
+all_RBNS <- list(mm_prox_RBNS, mm_dist_RBNS)
+names(all_RBNS) <- c("mm_prox_RBNS", "mm_dist_RBNS")
+all_RBNS <- bind_rows(all_RBNS, .id = "sample") %>% separate(sample, into = c("species", "UTR", "RBNS"), sep = "_") %>% ungroup()
+
+prox_enr <- all_RBNS %>% filter(UTR == "prox", log2FC > 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+prox_dep <- all_RBNS %>% filter(UTR == "prox", log2FC < 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+dist_enr <- all_RBNS %>% filter(UTR == "dist", log2FC > 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+dist_dep <- all_RBNS %>% filter(UTR == "dist", log2FC < 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+
+upset_dat <-list(prox_enr = prox_enr, prox_dep = prox_dep, dist_enr = dist_enr, dist_dep = dist_dep)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+
+```
+
+## RBNS Motif enrichment Summary
+
+Generally depleted from NR transcripts (proximal and distal UTRs):
+
+"PCBP2"  "HNRNPF" "HNRNPK" "RBM45"  "RBM6"   "SRSF9"
+
+Generally enriched for NR transcripts (proximal and distal UTRs):
+
+"FUBP3"    "BOLL"     "DAZ3"     "ELAVL4"   "RBM15B"   "TRNAU1AP"
+
+RBPs enriched in Distal NR UTRs:
+
+"HNRNPA0" "MBNL1"   "MSI1"    "RBM24"
+ 
+RBPs depleted in Distal NR UTRs:
+
+"NUPL2"
+
+RBPs enriched in Proximal NR UTRs:
+
+"HNRNPDL" "KHSRP"   "PUM1"    "RBM47"
+
+RBPs depleted in Proximal NR UTRs:
+
+"EIF4G2" "EWSR1"  "SRSF5"  "TARDBP"
+
+
+## Special focus on Hu Proteins
+
+```{r,  Hu metagene}
+Hu_PWM <- c(RBNS_PWM[names(RBNS_PWM)[grepl(names(RBNS_PWM), pattern = "ELAV")]], CISBPRNA_hs_PWM[names(CISBPRNA_hs_PWM)[grepl(names(CISBPRNA_hs_PWM), pattern = "ELAV")]])
+names(Hu_PWM) <- c("RBNS1_ELAVL4", "RBNS2_ELAVL4", "M031_ELAVL1", "M108_ELAVL1", "M112_ELAVL1", "M124_ELAVL3", "M127_ELAVL1", "M232_ELAVL1", "M328_ELAVL2", "M329_ELAVL2", "M330_ELAVL2")
+
+metagene_motif(Hu_PWM, mm_prox, mm_dist, "Proximal", "Distal", "Hu Motifs across NR genes") + scale_color_manual(values = c("#fc9867", "#78dce8"))
+metagene_motif(Hu_PWM, mm_prox, mm_ctrl_prox, "NR", "Control", "Hu Motifs across Proximal UTRs (NRvCtrl)") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+metagene_motif(Hu_PWM, mm_dist, mm_ctrl_dist, "NR", "Control", "Hu Motifs across Distal UTRs (NRvCtrl)") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+
+#Tandem
+metagene_motif(Hu_PWM, mm_prox[names(mm_prox)[names(mm_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_prox[names(mm_ctrl_prox)[names(mm_ctrl_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "NR", "Control", "Mouse  Proximal TUTR Hu Motif Content") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+metagene_motif(Hu_PWM, mm_dist[names(mm_dist)[names(mm_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], mm_ctrl_dist[names(mm_ctrl_dist)[names(mm_ctrl_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "NR", "Control", "Mouse NRvCtrl Distal TUTR Hu Motif Content") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+
+#ALEs
+metagene_motif(Hu_PWM, mm_prox[names(mm_prox)[names(mm_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_prox[names(mm_ctrl_prox)[names(mm_ctrl_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "NR", "Control", "Mouse  Proximal ALE Hu Motif Content") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+metagene_motif(Hu_PWM, mm_dist[names(mm_dist)[names(mm_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], mm_ctrl_dist[names(mm_ctrl_dist)[names(mm_ctrl_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "NR", "Control", "Mouse NRvCtrl Distal ALE Hu Motif Content") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+```
+
+```{r, Hu Enrichments across UTR type}
+mm_prox_Hu <- motif_compare(Hu_PWM, mm_prox, mm_ctrl_prox)
+motif_plot(mm_prox_Hu) + ggtitle("Hu Protein motifs in NR Proximal UTRS")
+mm_dist_Hu <- motif_compare(Hu_PWM, mm_dist, mm_ctrl_dist)
+motif_plot(mm_dist_Hu) + ggtitle("Hu Protein motifs in NR distal UTRS")
+
+mm_prox_TUTR_Hu <- motif_compare(Hu_PWM, mm_prox[names(mm_prox)[names(mm_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_prox[names(mm_ctrl_prox)[names(mm_ctrl_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]])
+mm_dist_TUTR_Hu <- motif_compare(Hu_PWM, mm_dist[names(mm_dist)[names(mm_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], mm_ctrl_dist[names(mm_ctrl_dist)[names(mm_ctrl_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]])
+
+#ALEs
+mm_prox_ALE_Hu <- motif_compare(Hu_PWM, mm_prox[names(mm_prox)[names(mm_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_prox[names(mm_ctrl_prox)[names(mm_ctrl_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]])
+mm_dist_ALE_Hu <- motif_compare(Hu_PWM, mm_dist[names(mm_dist)[names(mm_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], mm_ctrl_dist[names(mm_ctrl_dist)[names(mm_ctrl_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]])
+
+Hu_compare <- list(mm_prox_TUTR_Hu, mm_dist_TUTR_Hu, mm_prox_ALE_Hu, mm_dist_ALE_Hu)
+names(Hu_compare) <- c("mm_prox_TUTR", "mm_dist_TUTR", "mm_prox_ALE", "mm_dist_ALE")
+Hu_compare <- bind_rows(Hu_compare, .id = "sample") %>% 
+  separate(sample, into = c("species", "UTR", "genetype")) %>% 
+  separate(motif, into = c("motif", "RBP")) %>% 
+  mutate(sig = ifelse(p_adj < 0.05, "< 0.05", "ns"))
+
+Hu_compare %>% filter(UTR == "prox") %>% 
+  ggplot(aes(x = log2FC, y = -log(p_adj)), col = sig) + 
+  geom_point(aes(col = sig)) + 
+  geom_text(data = subset(Hu_compare, sig == "< 0.05"), aes(label = RBP), nudge_y = 1, col = "Red") + 
+  facet_wrap(.~genetype, scales = "free_y", nrow = 2) + 
+  theme_cowplot() + 
+  scale_color_manual(values = c("Red", "Grey")) + 
+  labs(title = "Proximal UTRs and Hu Binding Sites by type") +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+Hu_compare %>% filter(UTR == "dist") %>% 
+  ggplot(aes(x = log2FC, y = -log(p_adj)), col = sig) + 
+  geom_point(aes(col = sig)) + 
+  geom_text(data = subset(Hu_compare, sig == "< 0.05"), aes(label = RBP), nudge_y = 1, col = "Red") + 
+  facet_wrap(.~genetype, scales = "free_y", nrow = 2) +
+  theme_cowplot() + 
+  scale_color_manual(values = c("Red", "Grey")) + 
+  labs(title = "Distal UTRs and Hu Binding Sites by type") +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+```
+
+# Now for looking at Sequence downstream of Proximal PAS of NR genes
+100 nucleotides upstream of the proximal UTR end (PAS or polyadenylation site) and 100 nt were extracted for Neuronally restricted and control genes
+
+```{r, get flanking PAS seqs}
+export_seqs <- function(tx_list, file_name, species){
+  
+  if (species == "mm"){
+    
+    tx_gff <- promoters(mmpolya_txdb, upstream = 100, downstream = 100)
+    tx_gff <- tx_gff[names(tx_gff) %in% tx_list]
+    seq <- getSeq(Mmusculus, tx_gff)
+    
+  } else if (species == "hs"){
+    
+    tx_gff <- promoters(hspolya_txdb, upstream = 100, downstream = 100)
+    tx_gff <- tx_gff[names(tx_gff) %in% tx_list]
+    seq <- getSeq(Hsapiens, tx_gff)
+  
+  }
+  
+  writeXStringSet(seq, paste(file_name, ".fa", sep = ""), format = "fasta")
+}
+
+#export_seqs(mm_prox_genes, "psidat/fastas/mm_NR_ds_PAS", "mm")
+#export_seqs(mm_ctrl_prox_genes, "psidat/fastas/mm_ctrl_ds_PAS", "mm")
+
+mm_ds <- readDNAStringSet("psidat/fastas/mm_NR_ds_PAS.fa")
+mm_ctrl_ds <- readDNAStringSet("psidat/fastas/mm_ctrl_ds_PAS.fa")
+
+```
+
+## U content around Proximal PAS
+
+```{r, }
+ds_U <- get_U(subseq(mm_ds, start = 101, end = 200)) %>% 
+  mutate(gene = substr(gene, 1, 18))
+ds_ctrl_U <- get_U(subseq(mm_ctrl_ds, start = 101, end = 200)) %>% 
+  mutate(gene = substr(gene, 1, 18))
+ds_U_compare <- U_compare(subseq(mm_ds, start = 101, end = 200), subseq(mm_ctrl_ds, start = 101, end = 200))
+ds_U_compare
+
+us_U <- get_U(subseq(mm_ds, start = 1, end = 101)) %>% 
+  mutate(gene = substr(gene, 1, 18))
+us_ctrl_U <- get_U(subseq(mm_ctrl_ds, start = 1, end = 101)) %>% 
+  mutate(gene = substr(gene, 1, 18))
+us_U_compare <- U_compare(subseq(mm_ds, start = 1, end = 101), subseq(mm_ctrl_ds, start = 1, end = 101))
+us_U_compare
+
+All_U_compare<- rbind(us_U_compare, ds_U_compare) %>% 
+  as_tibble() %>% 
+  mutate(group = c("Upstream", "Downstream")) 
+
+All_U_compare %>%  
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(All_U_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("Upstream", "Downstream")) + 
+  labs(title = "U content of Proximal PAS (NR/Control)", subtitle = "NR genes are more U rich around proximal PAS than Control  Genes \nThis is especially true downstream")
+
+all_U <- ds_U %>% 
+  dplyr::rename("NR_ds" = U) %>% 
+  full_join(., ds_ctrl_U) %>% 
+  dplyr::rename("Control_ds" = U) %>%
+  full_join(., us_U) %>% 
+  dplyr::rename("NR_us" = U) %>%
+  full_join(., us_ctrl_U) %>% 
+  dplyr::rename("Control_us" = U) %>%
+  gather(-gene, key = group, value = U) %>% 
+  separate(group, into = c("group", "region"), sep = "_") %>% 
+  left_join(., genetypes, by = c("gene" = "Gene")) %>% 
+  na.omit()
+
+all_U %>% 
+  ggplot(aes(x = factor(group, levels = c("NR", "Control")), y = U, fill = factor(group, levels = c("NR", "Control")))) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot()  + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  facet_grid(.~factor(region, levels = c("us", "ds"), labels = c("Upstream", "Downstream"))) +
+  labs(x = "", title = "U content around Proximal PAS", subtitle = "NR genes are more U rich upstream and downstream of Proximal PAS") +
+  scale_fill_manual(values = c("#ffd866", "#cfd0e4")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"))
+
+all_U %>% 
+  filter(genetype != "mixed") %>% 
+  ggplot(aes(x = factor(group, levels = c("NR", "Control")), y = U, fill = factor(group, levels = c("NR", "Control")))) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(genetype~factor(region, levels = c("us", "ds"), labels = c("Upstream", "Downstream"))) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  EnvStats::stat_n_text() +
+  labs(x = "", title = "U content around Proximal PAS by Genetype", subtitle = "Both UTR types contribute to U richness downstream of proxmial PAS") +
+  scale_fill_manual(values = c("#ffd866", "#cfd0e4")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"),
+        strip.text.y = element_text(size = 12, color = "Black", face = "bold"))
+
+```
+
+## U content across the PAS 
+U content is binned across the 200 nt sequence
+
+```{r, Ucontent metagenes}
+
+# all UTR types together
+metagene_flank_nt(mm_ds, mm_ctrl_ds, "T", "NR, N = 1100", "Control, N = 2399", "U Content around Proximal PAS") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+
+#Tandem
+metagene_flank_nt(mm_ds[names(mm_ds)[names(mm_ds) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_ds[names(mm_ctrl_ds)[names(mm_ctrl_ds) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "T", "NR, N = 758", "Control, N = 1694", "Proximal PAS TUTR U Content") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+
+#ALEs
+metagene_flank_nt(mm_ds[names(mm_ds)[names(mm_ds) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_ds[names(mm_ctrl_ds)[names(mm_ctrl_ds) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "T", "NR, N = 315", "Control, N = 640", "Proximal PAS ALE U Content") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+
+```
+
+```{r, U content heatmaps, echo = FALSE}
+  m <- c(1:length(mm_ds))
+  list1 <- lapply(m, function(m) tibble("content" = letterFrequencyInSlidingView(mm_ds[[m]], 1, "T"), "pos" = c(1:200)))
+  names(list1) <- substr(names(mm_ds), 1, 18)
+  one <- bind_rows(list1, .id = "gene") %>% mutate(U = content[,1]) %>% dplyr::select(gene,pos,U) %>% mutate(group = "NR")
+  n <- c(1:length(mm_ctrl_ds))
+  list2 <- lapply(n, function(n) tibble("content" = letterFrequencyInSlidingView(mm_ctrl_ds[[n]], 1, "T"), "pos" = c(1:200)))
+  names(list2) <- substr(names(mm_ctrl_ds), 1, 18)
+  two <- bind_rows(list1, .id = "gene") %>% mutate(U = content[,1]) %>% dplyr::select(gene,pos,U) %>% mutate(group = "Control")
+
+  p <- rbind(one, two)
+
+  filtData <- p %>%   
+  spread(pos,U) %>% 
+  mutate(std = matrixStats::rowSds(as.matrix(.[3:202]))) %>% 
+  filter(std != 0) %>% 
+  dplyr::select(-std) %>% 
+  arrange(group)
+  
+
+mat <- as.matrix(filtData[,3:202])
+rownames(mat) <- filtData$gene
+annodf <- filtData %>% dplyr::select(gene, group) %>% as.data.frame()
+colnames(annodf) <- NULL
+
+#ph <- pheatmap::pheatmap(mat = mat,
+#                 cluster_cols = FALSE,
+#                 cluster_rows = FALSE,
+#                 show_rownames = FALSE,
+#                 scale = "row",
+#                 annotation_row = annodf,
+#                 color = viridis::viridis(20))
+
+```
+
+## Kmer content downstream of PAS
+
+```{r, kmers}
+PAS_kmer_compare <- kmer_compare(subseq(mm_ds, start = 101, end = 200), subseq(mm_ctrl_ds, start = 101, end = 200), 5)
+PAS_kmer_compare
+kmer_plot(PAS_kmer_compare) + ggtitle("Kmers downstream of Proximal PAS (NRvControl)")
+
+enr_kmer <- PAS_kmer_compare %>% filter(log2FC > 0, p_adj < 0.05) %>% pull(kmer)
+dep_kmer <- PAS_kmer_compare %>% filter(log2FC < 0, p_adj < 0.05) %>% pull(kmer)
+
+kmer2logo(enr_kmer, "kmers enriched downstream of PAS in NR genes")
+kmer2logo(dep_kmer, "kmers depleted downstream of PAS in NR genes")
+
+```
+
+## Hu Protein Motif content around Proximal PAS
+
+```{r, Hu motifs}
+
+Hu_ds <- motif_compare(Hu_PWM, subseq(mm_ds, start = 101, end = 200), subseq(mm_ctrl_ds, start = 101, end = 200))
+motif_plot(Hu_ds) + ggtitle("Hu Protein Motifs Downstream of Proximal PAS") 
+Hu_us <- motif_compare(Hu_PWM, subseq(mm_ds, start = 1, end = 100), subseq(mm_ctrl_ds, start = 101, end = 200))
+motif_plot(Hu_us) + ggtitle("Hu Protein Motifs Upstream of Proximal PAS") 
+
+metagene_flank_motif(Hu_PWM, mm_ds, mm_ctrl_ds, "Hu Protein Motifs across Proximal PAS") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+
+#Tandem
+metagene_flank_motif(Hu_PWM, mm_ds[names(mm_ds)[names(mm_ds) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_ds[names(mm_ctrl_ds)[names(mm_ctrl_ds) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "Hu Protein Motifs across TUTR Proximal PAS") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+
+#ALEs
+metagene_flank_motif(Hu_PWM, mm_ds[names(mm_ds)[names(mm_ds) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_ds[names(mm_ctrl_ds)[names(mm_ctrl_ds) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "Hu Protein Motifs across ALE Proximal PAS") + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+
+```
+
+```{r, Hu Heatmap on Ranked NR genes}
+flank_motif_df <- function(PWM_list, caseDNAStringSet, ctrlDNAStringSet, title){
+
+   case_list <- lapply(PWM_list, function(x) lapply(caseDNAStringSet, function(y) matchPWM(x,y) %>% data.frame(start = start(.), end = end(.))))
+  case_df <- case_list %>% 
+    unlist(recursive = FALSE) %>% 
+    bind_rows(., .id = "key") %>% 
+    as_tibble() %>% 
+    dplyr::rename("match" = 2) %>% 
+    separate(key, into = c("motif", "RBP", "gene", "UTR"), extra = "merge") %>%
+    mutate(pos = round(((end - start)*0.5) + start), 
+           bin = ifelse(pos > 0 & pos <= 20, "-100", 
+                        ifelse(pos > 20 & pos <= 40, "-80", 
+                               ifelse(pos > 40 & pos <= 60, "-60",
+                                      ifelse(pos > 60 & pos <= 80, "-40",
+                                             ifelse(pos > 80 & pos <= 100, "-20", 
+                                                           ifelse(pos > 100 & pos <= 120, "20",
+                                                                  ifelse(pos > 120 & pos <= 140, "40", 
+                                                                         ifelse(pos > 140 & pos <= 160, "60", 
+                                                                                ifelse(pos > 160 & pos <= 180, "80",
+                                                                                       ifelse(pos > 180 & pos <= 200, "100", ""))))))))))) %>%
+    group_by(bin, RBP, gene) %>% 
+    summarize(count = n()) %>% 
+    mutate(group = "NR")
+  
+   ctrl_list <- lapply(PWM_list, function(x) lapply(ctrlDNAStringSet, function(y) matchPWM(x,y) %>% data.frame(start = start(.), end = end(.))))
+  ctrl_df <- ctrl_list %>% 
+    unlist(recursive = FALSE) %>% 
+    bind_rows(., .id = "key") %>% 
+    as_tibble() %>% 
+    dplyr::rename("match" = 2) %>% 
+    separate(key, into = c("motif", "RBP", "gene", "UTR"), extra = "merge") %>%
+    mutate(pos = round(((end - start)*0.5) + start), 
+           bin = ifelse(pos > 0 & pos <= 20, "-100", 
+                        ifelse(pos > 20 & pos <= 40, "-80", 
+                               ifelse(pos > 40 & pos <= 60, "-60",
+                                      ifelse(pos > 60 & pos <= 80, "-40",
+                                             ifelse(pos > 80 & pos <= 100, "-20", 
+                                                           ifelse(pos > 100 & pos <= 120, "20",
+                                                                  ifelse(pos > 120 & pos <= 140, "40", 
+                                                                         ifelse(pos > 140 & pos <= 160, "60", 
+                                                                                ifelse(pos > 160 & pos <= 180, "80",
+                                                                                       ifelse(pos > 180 & pos <= 200, "100", ""))))))))))) %>%
+    group_by(bin, RBP, gene) %>% 
+    summarize(count = n()) %>%
+    mutate(group = "ctrl")
+    
+  hit_df <- rbind(case_df, ctrl_df)  
+  #y_label <- hit_df %>% group_by(bin, group, RBP) %>% summarize(mean = mean(count), .groups = "drop") %>% pull(mean) %>% max()
+  
+#    p <- hit_df %>% ggline(x = "bin", y = "count", color = "group", add = "mean_se", size = 1.5, title = title, facet.by = "RBP", scales = "free_y", xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y.npc = 0.07) + scale_x_discrete(labels = c("-100", "-80", "-60", "-40", "-20", "0", "20", "40", "60", "80", "100")) 
+ 
+  return(hit_df)
+}
+
+all_Hu_df <- flank_motif_df(Hu_PWM, mm_ds, mm_ctrl_ds)
+ranks <- all_Hu_df %>% filter(bin > 0) %>% group_by(group,RBP,gene) %>% summarize(sum=sum(count)) %>% group_by(group,RBP) %>% mutate(rank = order(order(sum, decreasing = TRUE))) %>% arrange(group,RBP, desc(sum)) %>% dplyr::select(gene,group,RBP,rank) %>% ungroup()
+
+##meh
+left_join(all_Hu_df, ranks) %>% filter(RBP == "ELAVL2") %>% arrange(desc(group), rank)  %>% ggplot(aes(x = factor(bin, levels = c("-100", "-80", "-60", "-40", "-20", "20", "40", "60", "80", "100")), y = gene, fill = log2(count))) + geom_tile()
+
+
+
+all_ranked_motifs <- left_join(all_Hu_df, ranks) %>% 
+  filter(RBP == "ELAVL2") %>% 
+  spread(bin,count) %>% 
+  arrange(desc(group), rank) %>% 
+  dplyr::select(RBP,gene,group,rank,`-100`, `-80`, `-60`, `-40`, `-20`, `20`, `40`, `60`, `80`, `100`) %>% 
+  replace_na(list(`-100` = 0, `-80` = 0, `-60` = 0, `-40` = 0, `-20` = 0, `20` = 0, `40` = 0, `60` = 0, `80` = 0, `100` = 0)) %>%
+  ungroup() 
+annodf <- all_ranked_motifs %>% mutate(group = as.factor(group)) %>% dplyr:: select(group) %>% as.data.frame()
+rownames(annodf) <- all_ranked_motifs$gene
+
+p <- all_ranked_motifs %>% dplyr::select(5:14) %>% as.matrix()
+rownames(p) <- all_ranked_motifs$gene 
+p %>% +1 %>% log2() %>% pheatmap::pheatmap(cluster_cols = F, cluster_rows = F, color = viridis::viridis(20), show_rownames = FALSE, annotation_row = annodf, main = "ELAVL2", annotation_colors = list(group = c(ctrl = "#cfd0e4", NR = "#ffd866"))) 
+
+###
+
+#TUTR
+#TUTR_Hu_df <- flank_motif_df(Hu_PWM, mm_ds[names(mm_ds)[names(mm_ds) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_ds[names(mm_ctrl_ds)[names(mm_ctrl_ds) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]])
+
+#ALEs
+#ALE_Hu_df <- flank_motif_df(Hu_PWM, mm_ds[names(mm_ds)[names(mm_ds) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_ds[names(mm_ctrl_ds)[names(mm_ctrl_ds) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]])
+```
+
+```{r, U content heat map}
+
+x <- c(1:length(mm_ds))
+NR_list <- lapply(x, function(x) letterFrequencyInSlidingView(mm_ds[[x]], 1, "T"))
+NR_Df <- bind_cols(NR_list) %>% t() 
+colnames(NR_Df) <- c(1:200)
+rownames(NR_Df) <- names(mm_ds)
+NR_ranks <- NR_Df[,101:200] %>% rowSums() %>% as_tibble(rownames = "gene") %>% arrange(desc(value)) %>% mutate(rank = c(1:1100))
+
+x <- c(1:length(mm_ctrl_ds))
+ctrl_list <- lapply(x, function(x) letterFrequencyInSlidingView(mm_ctrl_ds[[x]], 1, "T"))
+ctrl_Df <- bind_cols(ctrl_list) %>% t() 
+colnames(ctrl_Df) <- c(1:200)
+rownames(ctrl_Df) <- names(mm_ctrl_ds)
+ctrl_ranks <- ctrl_Df[,101:200] %>% rowSums() %>% as_tibble(rownames = "gene") %>% arrange(desc(value)) %>% mutate(rank = c(1:2399))
+
+a <- as_tibble(NR_Df, rownames = "gene") %>% mutate(group = "NR") %>% left_join(NR_ranks) %>% dplyr::select(gene,group, value, rank, everything()) %>% arrange(rank)
+b <- as_tibble(ctrl_Df, rownames = "gene") %>% mutate(group = "ctrl") %>% left_join(ctrl_ranks) %>% dplyr::select(gene,group, value, rank, everything()) %>% arrange(rank)
+p <- rbind(a,b)
+
+annodf <- p %>% mutate(group = as.factor(group)) %>% dplyr::select(group) %>% as.data.frame()
+rownames(annodf) <- p$gene
+
+z <- p %>% dplyr::select(-gene, -group, -value, -rank) %>%  as.matrix() 
+rownames(z) <- p$gene
+pheatmap::pheatmap(z,
+                         cluster_rows = FALSE,
+                         cluster_cols = FALSE,
+                         color = viridis::viridis(20), 
+                         show_rownames = FALSE, 
+                         main = "U content", 
+                         annotation_row = annodf, 
+                         annotation_colors = list(group = c(ctrl = "#cfd0e4", NR = "#ffd866")))
+pheatmap::pheatmap(z[1:1100,],
+                         cluster_rows = T,
+                         cluster_cols = FALSE,
+                         color = viridis::viridis(20), 
+                         show_rownames = FALSE, 
+                         main = "NR U content", 
+                         annotation_row = annodf, 
+                         annotation_colors = list(group = c(ctrl = "#cfd0e4", NR = "#ffd866")))
+pheatmap::pheatmap(z[1101:2399,],
+                         cluster_rows = T,
+                         cluster_cols = FALSE,
+                         color = viridis::viridis(20), 
+                         show_rownames = FALSE, 
+                         main = "ctrl U content", 
+                         annotation_row = annodf, 
+                         annotation_colors = list(group = c(ctrl = "#cfd0e4", NR = "#ffd866")))
+
+
+###Rolling means!
+z_list <- t(z) %>% as.data.frame() %>%  frollmean(., 10, align = "center")
+names(z_list) <- rownames(z)
+zrolled <- z_list %>% bind_rows() %>% t()
+pheatmap::pheatmap(zrolled,
+                         cluster_rows = FALSE,
+                         cluster_cols = FALSE,
+                         color = viridis::viridis(20), 
+                         show_rownames = FALSE, 
+                         main = "U content", 
+                         annotation_row = annodf, 
+                         annotation_colors = list(group = c(ctrl = "#cfd0e4", NR = "#ffd866")))
+pheatmap::pheatmap(zrolled[1:1100,],
+                         cluster_rows = T,
+                         cluster_cols = FALSE,
+                         color = viridis::viridis(20), 
+                         show_rownames = FALSE, 
+                         main = "NR U content", 
+                         annotation_row = annodf, 
+                         annotation_colors = list(group = c(ctrl = "#cfd0e4", NR = "#ffd866")))
+pheatmap::pheatmap(zrolled[1101:2399,],
+                         cluster_rows = T,
+                         cluster_cols = FALSE,
+                         color = viridis::viridis(20), 
+                         show_rownames = FALSE, 
+                         main = "ctrl U content", 
+                         annotation_row = annodf, 
+                         annotation_colors = list(group = c(ctrl = "#cfd0e4", NR = "#ffd866")))
+
+
+
+
+  y_label <- p %>% gather(-gene, -group, -value, -rank, key = bin, value = content) %>% group_by(bin, group) %>% summarize(mean = mean(content), .groups = "drop") %>% pull(mean) %>% max()
+  
+p %>% gather(-gene, -group, -value, -rank, key = bin, value = content) %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = "U content", xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.02) + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+  
+y_label <- zrolled %>% as_tibble(rownames = "gene") %>% left_join(., p[,1:2]) %>% gather(-gene, -group, key = bin, value = content) %>% group_by(bin, group) %>% summarize(mean = mean(content), .groups = "drop") %>% pull(mean) %>% max()
+
+zrolled %>% as_tibble(rownames = "gene") %>% left_join(., p[,1:2]) %>% gather(-gene, -group, key = bin, value = content) %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = "U content rolling average", xlab = "Position around PAS") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.02) + scale_color_manual(values = c("#cfd0e4", "#ffd866"))
+
+```

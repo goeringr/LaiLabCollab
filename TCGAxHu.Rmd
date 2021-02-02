@@ -1,0 +1,309 @@
+---
+title: "Hu x TCGA"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(cowplot)
+library(ggpubr)
+library(AnnotationDbi)
+library(UpSetR)
+library(BSgenome.Hsapiens.NCBI.GRCh38)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(GenomicFeatures)
+library(RNAreachR)
+library(data.table)
+
+`%out%` <- Negate(`%in%`)
+`%notin%` <- Negate(`%in%`)
+```
+
+### We will only consider genes with 2 poly A sites (1 long isoform and 1 short)
+
+```{r, human genes with 2 polya sites}
+# human gff we will eventually pull sequences from:
+polya_txdb <- loadDb("psidat/twoUTR_polya_gff_txdb.sqlite")
+seqlevelsStyle(polya_txdb) <- "NCBI"
+# 4,554 genes with only two isoforms (short and long)
+hs2UTRids <- names(genes(polya_txdb)) %>% unique()
+genetypes <- read.table("psidat/human_genetype_table.txt", header = TRUE)
+
+```
+
+### Reading in LABRAT outputs and tidying them
+
+
+```{r, TCGA psi dat, warning = FALSE}
+
+# delta psi values (delta psi = TimePointX - Day02)
+TGCT <- tibble(read.table("psidat/TCGA/LABRAT.TGCT.psis.pval", header = TRUE)) %>% 
+  mutate(cancer = "TGCT") %>% dplyr::select(Gene, genetype, deltapsi, pval, FDR, cancer) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% hs2UTRids) # get rid of genes with more than 2 isoforms (50% of genes kept)
+#KICH <- tibble(read.table("psidat/TCGA/LABRAT.KICH.psis.pval", header = TRUE)) %>% 
+#  mutate(cancer = "KICH") %>% dplyr::select(Gene, genetype, deltapsi, pval, FDR, cancer) %>% 
+#  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+#  filter(Gene %in% hs2UTRids) # get rid of genes with more than 2 isoforms (50% of genes kept)
+PCPG <- tibble(read.table("psidat/TCGA/LABRAT.PCPG.psis.pval", header = TRUE)) %>% 
+  mutate(cancer = "PCPG") %>% dplyr::select(Gene, genetype, deltapsi, pval, FDR, cancer) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% hs2UTRids) # get rid of genes with more than 2 isoforms (50% of genes kept)
+GBM <- tibble(read.table("psidat/TCGA/LABRAT.GBM.psis.pval", header = TRUE)) %>% 
+  mutate(cancer = "GBM") %>% dplyr::select(Gene, genetype, deltapsi, pval, FDR, cancer) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% hs2UTRids) # get rid of genes with more than 2 isoforms (50% of genes kept)
+LGG <- tibble(read.table("psidat/TCGA/LABRAT.LGG.psis.pval", header = TRUE)) %>% 
+  mutate(cancer = "LGG") %>% dplyr::select(Gene, genetype, deltapsi, pval, FDR, cancer) %>% 
+  mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1]))) %>% # get rid of decimals in gene IDs
+  filter(Gene %in% hs2UTRids) # get rid of genes with more than 2 isoforms (50% of genes kept)
+
+
+dpsis <- bind_rows(TGCT, PCPG, GBM, LGG) 
+
+```
+
+### Generally, what does this data look like?
+
+```{r, general look, warning = FALSE}
+# Globally, Brain has the highest psi value
+dpsis %>% 
+    ggplot(aes(x = cancer, y = deltapsi, fill = cancer)) +  
+    geom_violin(alpha = 0.65) + 
+    geom_boxplot(width = 0.1, col = c("#dddddd", "#dddddd", "#dddddd", "#818181"), outlier.shape = NA) +
+    theme_cowplot() +
+    guides(fill = FALSE, alpha = FALSE) +
+    labs(x = "", title = "Human TCGA delta Psi Data") +
+    scale_fill_manual(values = viridis::viridis(4)) +
+    ylim(-0.3,0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    EnvStats::stat_n_text(y.pos = -0.25) 
+  
+
+dpsis %>% 
+    filter(FDR < 0.05) %>% 
+    ggplot(aes(x = cancer, y = deltapsi, fill = cancer)) +  
+    geom_violin(alpha = 0.65) + 
+    geom_boxplot(width = 0.1, col = c("#dddddd", "#dddddd", "#dddddd",  "#818181"), outlier.shape = NA) +
+    theme_cowplot() +
+    guides(fill = FALSE, alpha = FALSE) +
+    labs(x = "", title = "Human TCGA significant delta Psi Data") +
+    scale_fill_manual(values = viridis::viridis(4)) +
+    ylim(-0.3,0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    EnvStats::stat_n_text(y.pos = -0.25)
+
+## +genes 1108, -genes 3084 
+#pos_psi_genes <- dpsis %>%
+#    group_by(Gene) %>% 
+#    summarise(mean_psi = mean(deltapsi, na.rm = TRUE), med_psi = median(deltapsi, na.rm = TRUE),n = n()) %>% 
+#    filter(mean_psi > 0 & med_psi > 0) %>% 
+#    pull(Gene) %>% 
+#    unique()
+
+#neg_psi_genes <- dpsis %>%
+#    group_by(Gene) %>% 
+#    summarise(mean_psi = mean(deltapsi, na.rm = TRUE), med_psi = median(deltapsi, na.rm = TRUE),n = n()) %>% 
+#    filter(mean_psi < 0 | med_psi < 0) %>% 
+#    pull(Gene) %>% 
+#    unique()
+
+
+# GBM 50 sigc 5317 ctrl
+GBM_aff_genes <- GBM %>% filter(deltapsi > 0, FDR < 0.05) %>% pull(Gene) %>% unique()
+GBM_ctrl_genes <- pull(GBM,Gene)[pull(GBM,Gene) %notin% GBM_aff_genes] %>% unique()
+
+# LGG 244 sigc 5123 ctrl 
+LGG_aff_genes <- LGG %>% filter(deltapsi > 0, FDR < 0.05) %>% pull(Gene) %>% unique()
+LGG_ctrl_genes <- pull(LGG,Gene)[pull(LGG,Gene) %notin% LGG_aff_genes] %>% unique()
+
+# PCPG 173 sigc 5194 ctrl 
+PCPG_aff_genes <- PCPG %>% filter(deltapsi > 0, FDR < 0.05) %>% pull(Gene) %>% unique()
+PCPG_ctrl_genes <- pull(PCPG,Gene)[pull(PCPG,Gene) %notin% PCPG_aff_genes] %>% unique()
+
+# TGCT 130 sigc 5237 ctrl 
+TGCT_aff_genes <- TGCT %>% filter(deltapsi > 0, FDR < 0.05) %>% pull(Gene) %>% unique()
+TGCT_ctrl_genes <- pull(TGCT,Gene)[pull(TGCT,Gene) %notin% TGCT_aff_genes] %>% unique()
+
+upset_dat <-list(GBM = GBM_aff_genes, LGG = LGG_aff_genes, PCPG = PCPG_aff_genes, TGCT = TGCT_aff_genes)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+
+```
+
+
+```{r, psis over time}
+library(ggridges)
+
+#dpsis %>% 
+#  filter(genetype != "mixed") %>% 
+#  mutate(group = ifelse(Gene %in% pos_psi_genes, "affected (1108)", ifelse(Gene %in% neg_psi_genes, "ctrl (3084)", "NA"))) %>% 
+#  filter(group != "NA") %>% 
+#  ggplot(aes(x = cancer, y = deltapsi, fill = group)) +
+#  geom_violin() +
+#  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9),outlier.shape = NA) +
+#  facet_grid(.~genetype) +
+#  ylim(-0.3,0.3) +
+#  theme_cowplot() +
+#  theme(strip.background = element_rect(color = "white", fill = "white"),
+#        strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+           
+
+gridgedpsi <- function(dpsis, case_Gene, ctrl_Gene, GT,GR,title){
+  ggdraw() + draw_plot(dpsis %>% 
+    mutate(group = ifelse(Gene %in% case_Gene, "affected", ifelse(Gene %in% ctrl_Gene, "ctrl", "NA"))) %>% 
+    filter(genetype != "mixed", group != "NA") %>%
+    unite(group_type, group, genetype, sep = " ") %>% 
+    na.omit() %>%
+    ggplot(aes(x = deltapsi, y = group_type, fill = stat(x))) +
+    geom_density_ridges_gradient(scale = 3, rel_min_height = 0.01) +
+    scale_fill_viridis_c(name = "deltapsi", option = "C") +
+    labs(title = title, y = "") +
+    theme_cowplot() +
+    geom_vline(xintercept = 0, size = 1.5, linetype = "dashed") +
+    guides(fill = FALSE), 0, 0, 0.75, 1) + 
+    draw_plot(dpsis %>% 
+                mutate(group = ifelse(Gene %in% case_Gene, "affected", ifelse(Gene %in% ctrl_Gene, "ctrl", "NA"))) %>%
+                filter(genetype != "mixed", group != "NA") %>%
+                unite(group_type, group, genetype, sep = " ") %>% 
+                na.omit() %>%  
+                unique() %>% 
+                ggplot(aes(y = group_type)) +
+                geom_bar() + 
+                theme_cowplot() +
+                scale_y_discrete(labels = c("","","","")) +
+                labs(x = "", y = "") +
+                theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1)),  0.7, 0, 0.2, 0.84)
+}
+
+gridgedpsi(GBM,GBM_aff_genes, GBM_ctrl_genes, "ALE", "affected", "GBM Delta Psi")
+
+gridgedpsi(LGG, LGG_aff_genes, LGG_ctrl_genes, "ALE", "affected", "LGG Delta Psi")
+
+gridgedpsi(PCPG, PCPG_aff_genes, PCPG_ctrl_genes, "ALE", "affected", "PCPG Delta Psi")
+
+gridgedpsi(TGCT, TGCT_aff_genes, TGCT_ctrl_genes, "ALE", "affected", "TGCT Delta Psi")
+
+```
+
+```{r, get flanking PAS seqs}
+
+
+GBM_prox_genes <- unlist(lapply(GBM_aff_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+GBM_prox_ctrl_genes <- unlist(lapply(GBM_ctrl_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+
+LGG_prox_genes <- unlist(lapply(LGG_aff_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+LGG_prox_ctrl_genes <- unlist(lapply(LGG_ctrl_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+
+PCPG_prox_genes <- unlist(lapply(PCPG_aff_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+PCPG_prox_ctrl_genes <- unlist(lapply(PCPG_ctrl_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+
+TGCT_prox_genes <- unlist(lapply(TGCT_aff_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+TGCT_prox_ctrl_genes <- unlist(lapply(TGCT_ctrl_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+
+export_seqs <- function(tx_list, file_name, species){
+  
+  if (species == "mm"){
+    
+    tx_gff <- promoters(mmpolya_txdb, upstream = 100, downstream = 100)
+    tx_gff <- tx_gff[names(tx_gff) %in% tx_list]
+    seq <- getSeq(Mmusculus, tx_gff)
+    
+  } else if (species == "hs"){
+    
+    tx_gff <- promoters(polya_txdb, upstream = 100, downstream = 100)
+    tx_gff <- tx_gff[names(tx_gff) %in% tx_list]
+    seq <- getSeq(Hsapiens, tx_gff)
+  
+  }
+  
+  writeXStringSet(seq, paste(file_name, ".fa", sep = ""), format = "fasta")
+}
+
+#export_seqs(GBM_prox_genes, "psidat/TCGA/GBM_aff_PAS", "hs")
+#export_seqs(GBM_prox_ctrl_genes, "psidat/TCGA/GBM_ctrl_PAS", "hs")
+#export_seqs(LGG_prox_genes, "psidat/TCGA/LGG_aff_PAS", "hs")
+#export_seqs(LGG_prox_ctrl_genes, "psidat/TCGA/LGG_ctrl_PAS", "hs")
+#export_seqs(PCPG_prox_genes, "psidat/TCGA/PCPG_aff_PAS", "hs")
+#export_seqs(PCPG_prox_ctrl_genes, "psidat/TCGA/PCPG_ctrl_PAS", "hs")
+#export_seqs(TGCT_prox_genes, "psidat/TCGA/TGCT_aff_PAS", "hs")
+#export_seqs(TGCT_prox_ctrl_genes, "psidat/TCGA/TGCT_ctrl_PAS", "hs")
+
+GBM_PAS <- readDNAStringSet("psidat/TCGA/GBM_aff_PAS.fa")
+GBM_ctrl_PAS <- readDNAStringSet("psidat/TCGA/GBM_ctrl_PAS.fa")
+LGG_PAS <- readDNAStringSet("psidat/TCGA/LGG_aff_PAS.fa")
+LGG_ctrl_PAS <- readDNAStringSet("psidat/TCGA/LGG_ctrl_PAS.fa")
+PCPG_PAS <- readDNAStringSet("psidat/TCGA/PCPG_aff_PAS.fa")
+PCPG_ctrl_PAS <- readDNAStringSet("psidat/TCGA/PCPG_ctrl_PAS.fa")
+TGCT_PAS <- readDNAStringSet("psidat/TCGA/TGCT_aff_PAS.fa")
+TGCT_ctrl_PAS <- readDNAStringSet("psidat/TCGA/TGCT_ctrl_PAS.fa")
+
+```
+
+#U content across proximal PAS
+
+```{r, U content heat map, warning=FALSE}
+
+Udat <- function(PAS, ctrl_PAS){
+  x <- c(1:length(PAS))
+  NR_list <- lapply(x, function(x) letterFrequencyInSlidingView(PAS[[x]], 1, "T"))
+  NR_Df <- bind_cols(NR_list) %>% t() 
+  colnames(NR_Df) <- c(1:200)
+  rownames(NR_Df) <- names(PAS)
+  NR_ranks <- NR_Df[,101:200] %>% rowSums() %>% as_tibble(rownames = "gene") %>% arrange(desc(value)) %>% mutate(rank = c(1:nrow(.)))
+  
+  x <- c(1:length(ctrl_PAS))
+  ctrl_list <- lapply(x, function(x) letterFrequencyInSlidingView(ctrl_PAS[[x]], 1, "T"))
+  ctrl_Df <- bind_cols(ctrl_list) %>% t() 
+  colnames(ctrl_Df) <- c(1:200)
+  rownames(ctrl_Df) <- names(ctrl_PAS)
+  ctrl_ranks <- ctrl_Df[,101:200] %>% rowSums() %>% as_tibble(rownames = "gene") %>% arrange(desc(value)) %>% mutate(rank = c(1:nrow(.)))
+  
+  a <- as_tibble(NR_Df, rownames = "gene") %>% mutate(group = "affected") %>% left_join(NR_ranks) %>% dplyr::select(gene,group, value, rank, everything()) %>% arrange(rank)
+  b <- as_tibble(ctrl_Df, rownames = "gene") %>% mutate(group = "ctrl") %>% left_join(ctrl_ranks) %>% dplyr::select(gene,group, value, rank, everything()) %>% arrange(rank)
+  p <- rbind(a,b)
+  return(p)
+} 
+  
+rollU <- function(p){
+  z <- p %>% dplyr::select(-gene, -group, -value, -rank) %>%  as.matrix() 
+  rownames(z) <- p$gene
+  
+  ###Rolling means!
+  z_list <- t(z) %>% as.data.frame() %>%  data.table::frollmean(., 10, align = "center")
+  names(z_list) <- rownames(z)
+  zrolled <- z_list %>% bind_rows() %>% t()
+  colnames(zrolled) <- c(-100:-1,1:100)
+  return(zrolled)
+}
+
+GBM_U <- Udat(GBM_PAS, GBM_ctrl_PAS)
+LGG_U <- Udat(LGG_PAS, LGG_ctrl_PAS)
+PCPG_U <- Udat(PCPG_PAS, PCPG_ctrl_PAS)
+TGCT_U <- Udat(TGCT_PAS, TGCT_ctrl_PAS)
+
+GBM_U_rolled <- rollU(GBM_U)
+LGG_U_rolled <- rollU(LGG_U)
+PCPG_U_rolled <- rollU(PCPG_U)
+TGCT_U_rolled <- rollU(TGCT_U)
+
+#faceted rolled
+GBM_U_rolled %>% as_tibble(rownames = "gene") %>% left_join(., GBM_U[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group,-genetype, key = bin, value = content) %>% filter(genetype != "mixed") %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = "GBM U content rolling average", xlab = "Position around PAS", ylab = "U Frequency (%)", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = 0.3) + scale_color_manual(values = c("#ffd866", "#cfd0e4")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + facet_wrap(.~genetype, nrow = 2) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+LGG_U_rolled %>% as_tibble(rownames = "gene") %>% left_join(., LGG_U[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group,-genetype, key = bin, value = content) %>% filter(genetype != "mixed") %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = "LGG U content rolling average", xlab = "Position around PAS", ylab = "U Frequency (%)", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = 0.3) + scale_color_manual(values = c("#ffd866", "#cfd0e4")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + facet_wrap(.~genetype, nrow = 2) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+PCPG_U_rolled %>% as_tibble(rownames = "gene") %>% left_join(., PCPG_U[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group,-genetype, key = bin, value = content) %>% filter(genetype != "mixed") %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = "PCPG U content rolling average", xlab = "Position around PAS", ylab = "U Frequency (%)", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = 0.3) + scale_color_manual(values = c("#ffd866", "#cfd0e4")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + facet_wrap(.~genetype, nrow = 2) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+TGCT_U_rolled %>% as_tibble(rownames = "gene") %>% left_join(., TGCT_U[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group,-genetype, key = bin, value = content) %>% filter(genetype != "mixed") %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = "TGCT U content rolling average", xlab = "Position around PAS", ylab = "U Frequency (%)", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = 0.3) + scale_color_manual(values = c("#ffd866", "#cfd0e4")) + scale_x_discrete(breaks=c(-75,-50,-25,0,25,50,75)) + facet_wrap(.~genetype, nrow = 2) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+```
+
+```{r, eval = FALSE}
+
+#plot for Seungjae
+t <- GBM_U_rolled[,110:200]
+colnames(t) <- c(10:100)
+t %>% as_tibble(rownames = "gene") %>% left_join(., p[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group, -genetype, key = bin, value = content) %>% filter(genetype == "ALE") %>% mutate(group = ifelse(group == "affected", "affected (268)", "control (1159)")) %>% ggline(x = "bin", y = "content", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human ALE U content", xlab = "position downstream to polyA site", ylab = "U frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.295) + scale_color_manual(values = c("Red", "Blue")) + scale_x_discrete(breaks=c(10,30,50,70,90))
+
+t %>% as_tibble(rownames = "gene") %>% left_join(., p[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group,-genetype, key = bin, value = content) %>% filter(genetype == "TUTR") %>% mutate(group = ifelse(group == "affected", "affected (828)", "control (3025)")) %>% ggline(x = "bin", y = "content", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human TUTR U content", xlab = "position downstream to polyA site", ylab = "U frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.295) + scale_color_manual(values = c("Red", "Blue")) + scale_x_discrete(breaks=c(10,30,50,70,90))
+
+```

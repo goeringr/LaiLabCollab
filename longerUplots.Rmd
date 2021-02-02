@@ -1,0 +1,328 @@
+---
+title: "Longer U plots"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(cowplot)
+library(ggpubr)
+library(AnnotationDbi)
+library(UpSetR)
+library(BSgenome.Hsapiens.NCBI.GRCh38)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(GenomicFeatures)
+library(RNAreachR)
+
+`%out%` <- Negate(`%in%`)
+`%notin%` <- Negate(`%in%`)
+```
+
+```{r cars}
+# human gff we will eventually pull sequences from:
+hs_polya_txdb <- loadDb("psidat/twoUTR_polya_gff_txdb.sqlite")
+seqlevelsStyle(hs_polya_txdb) <- "NCBI"
+# 4,554 genes with only two isoforms (short and long)
+hs2UTRids <- names(genes(hs_polya_txdb)) %>% unique()
+hs_genetypes <- read.table("psidat/human_genetype_table.txt", header = TRUE)
+
+# mouse gff we will eventually pull sequences from:
+mm_polya_txdb <- loadDb("psidat/twoUTR_polya_mm_gff_txdb.sqlite")
+# 4,554 genes with only two isoforms (short and long)
+mm2UTRids <- names(genes(mm_polya_txdb)) %>% unique()
+mm_genetypes <- read.table("psidat/mouse_genetype_table.txt", header = TRUE)
+
+```
+
+```{r, }
+hsDiff_genes <- readRDS("psidat/Burke2020/hsDiff_genes.txt")
+hsDiff_ctrl_genes <-  readRDS("psidat/Burke2020/hsDiff_ctrl_genes.txt")
+mmDiff_genes <- readRDS("psidat/mm_NR_genes.txt")
+mmDiff_ctrl_genes <- readRDS("psidat/mm_ctrl_genes.txt")
+
+hsDiff_prox_genes <- unlist(lapply(hsDiff_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+hsDiff_prox_ctrl_genes <- unlist(lapply(hsDiff_ctrl_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+mmDiff_prox_genes <- unlist(lapply(mmDiff_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+mmDiff_prox_ctrl_genes <- unlist(lapply(mmDiff_ctrl_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+
+export_seqs <- function(tx_list, file_name, species){
+  
+  if (species == "mm"){
+    
+    tx_gff <- promoters(mm_polya_txdb, upstream = 1000, downstream = 1000)
+    tx_gff <- tx_gff[names(tx_gff) %in% tx_list]
+    seq <- getSeq(Mmusculus, tx_gff)
+    
+  } else if (species == "hs"){
+    
+    tx_gff <- promoters(hs_polya_txdb, upstream = 1000, downstream = 1000)
+    tx_gff <- tx_gff[names(tx_gff) %in% tx_list]
+    seq <- getSeq(Hsapiens, tx_gff)
+  
+  }
+  
+  writeXStringSet(seq, paste(file_name, ".fa", sep = ""), format = "fasta")
+}
+
+export_seqs(hsDiff_prox_genes, "psidat/Burke2020/NR_hs_PAS_long", "hs")
+export_seqs(hsDiff_prox_ctrl_genes, "psidat/Burke2020/ctrl_hs_PAS_long", "hs")
+export_seqs(mmDiff_prox_genes, "psidat/NR_mm_PAS_long", "mm")
+export_seqs(mmDiff_prox_ctrl_genes, "psidat/ctrl_mm_PAS_long", "mm")
+
+hs_PAS <- readDNAStringSet("psidat/Burke2020/NR_hs_PAS_long.fa")
+hs_ctrl <- readDNAStringSet("psidat/Burke2020/ctrl_hs_PAS_long.fa")
+mm_PAS <- readDNAStringSet("psidat/NR_mm_PAS_long.fa")
+mm_ctrl <- readDNAStringSet("psidat/ctrl_mm_PAS_long.fa")
+
+```
+
+```{r, U content heat map, warning=FALSE}
+
+UDat <- function(PAS,ctrl_PAS){
+  x <- c(1:length(PAS))
+  NR_list <- lapply(x, function(x) letterFrequencyInSlidingView(hs_PAS[[x]], 1, "T"))
+  NR_Df <- bind_cols(NR_list) %>% t() 
+  colnames(NR_Df) <- c(-1000:-1,1:1000)
+  rownames(NR_Df) <- names(PAS)
+  NR_ranks <- NR_Df[,1:1000] %>% rowSums() %>% as_tibble(rownames = "gene") %>% arrange(desc(value)) %>% mutate(rank = c(1:nrow(.)))
+  
+  x <- c(1:length(ctrl_PAS))
+  ctrl_list <- lapply(x, function(x) letterFrequencyInSlidingView(ctrl_PAS[[x]], 1, "T"))
+  ctrl_Df <- bind_cols(ctrl_list) %>% t() 
+  colnames(ctrl_Df) <- c(-1000:-1,1:1000)
+  rownames(ctrl_Df) <- names(ctrl_PAS)
+  ctrl_ranks <- ctrl_Df[,1:1000] %>% rowSums() %>% as_tibble(rownames = "gene") %>% arrange(desc(value)) %>% mutate(rank = c(1:nrow(.)))
+  
+  a <- as_tibble(NR_Df, rownames = "gene") %>% mutate(group = "NR") %>% left_join(NR_ranks) %>% dplyr::select(gene,group, value, rank, everything()) %>% arrange(rank)
+  b <- as_tibble(ctrl_Df, rownames = "gene") %>% mutate(group = "ctrl") %>% left_join(ctrl_ranks) %>% dplyr::select(gene,group, value, rank, everything()) %>% arrange(rank)
+  p <- rbind(a,b)
+  
+  return(p)
+}
+
+rolledU <- function(U_Dat){
+  z <- U_Dat %>% dplyr::select(-gene, -group, -value, -rank) %>%  as.matrix() 
+  rownames(z) <- U_Dat$gene
+  
+  ###Rolling means!
+  z_list <- t(z) %>% as.data.frame() %>%  data.table::frollmean(., 10, align = "center")
+  names(z_list) <- rownames(z)
+  zrolled <- z_list %>% bind_rows() %>% t()
+  colnames(zrolled) <- c(-1000:-1,1:1000)
+  return(zrolled)
+}
+
+hs_U <- UDat(hs_PAS, hs_ctrl)
+mm_U <- UDat(mm_PAS, mm_ctrl)
+
+hs_rolled <- rolledU(hs_U)
+mm_rolled <- rolledU(mm_U)
+
+```
+
+##Human
+
+```{r, human, warning=FALSE}
+
+#faceted rolled
+hs_rolled %>% as_tibble(rownames = "gene") %>% left_join(., hs_U[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(hs_genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group,-genetype, key = bin, value = content) %>% filter(genetype != "mixed") %>% ggline(x = "bin", y = "content", color = "group", add = "mean", size = 1.5, title = "Human U content rolling average", xlab = "Position around PAS", ylab = "U Frequency (%)", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = 0.35) + scale_x_discrete(breaks=c(-950,-750,-550,-350,-150,150,350,550,750,950)) + facet_wrap(.~genetype, nrow = 2) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + stat_summary(aes(x=bin,y=content, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Blue", "Red")) + scale_fill_manual(values = c("Red", "Blue"))
+
+############trying to make nice stars for fig7
+t <- hs_rolled[,1010:1100] %>% as_tibble(rownames = "gene") %>% left_join(., hs_U[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(hs_genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group, -genetype, key = bin, value = content) %>% filter(genetype == "ALE") %>% mutate(group = ifelse(group == "NR", "Bypassed ALE PAS (269)", "Unbypassed ALE PAS (789)")) 
+p <- t %>% group_by(group,bin) %>% summarize(mean_content=mean(content,na.rm = TRUE)) %>% ungroup()
+l <- t %>% group_by(bin) %>% do(w=wilcox.test(content~group,data = .)) %>% summarize(bin,wilcox=w$p.value) %>% mutate(sig.lab = ifelse(wilcox < 0.05, "*", ""))
+p %>% left_join(.,l) %>% mutate(bin = as.numeric(bin)) %>% ggplot(aes(x = bin, y = mean_content, color = group)) + geom_point(size = 1.75) + geom_line(aes(group=group),size = 1.25) + theme_cowplot() + geom_text(aes(label = c(subset((p %>% left_join(.,l)), group == "Bypassed ALE PAS (269)")$sig.lab,rep("",91)), group = NULL, color = NULL), nudge_y = 0.005, size = 5, show.legend = FALSE) + labs(title = "Human ALE U content", x = "position downstream to pA site", y = "U frequency (%)") + scale_color_manual(values = c("Red", "Blue")) + theme(legend.position="top")
+
+t <- hs_rolled[,1010:1100] %>% as_tibble(rownames = "gene") %>% left_join(., hs_U[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(hs_genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group, -genetype, key = bin, value = content) %>% filter(genetype == "TUTR") %>% mutate(group = ifelse(group == "NR", "Bypassed TUTR PAS (706)", "Unbypassed TUTR PAS (1993)")) 
+p <- t %>% group_by(group,bin) %>% summarize(mean_content=mean(content,na.rm = TRUE)) %>% ungroup()
+l <- t %>% group_by(bin) %>% do(w=wilcox.test(content~group,data = .)) %>% summarize(bin,wilcox=w$p.value) %>% mutate(sig.lab = ifelse(wilcox < 0.05, "*", ""))
+p %>% left_join(.,l) %>% mutate(bin = as.numeric(bin)) %>% ggplot(aes(x = bin, y = mean_content, color = group)) + geom_point(size = 1.75) + geom_line(aes(group=group),size = 1.25) + theme_cowplot() + geom_text(aes(label = c(subset((p %>% left_join(.,l)), group == "Bypassed TUTR PAS (706)")$sig.lab,rep("",91)), group = NULL, color = NULL), nudge_y = 0.005, size = 5, show.legend = FALSE) + labs(title = "Human TUTR U content", x = "position downstream to pA site", y = "U frequency (%)") + scale_color_manual(values = c("Red", "Blue")) + theme(legend.position="top")
+
+
+
+#############
+
+
+#200ds
+t <- hs_rolled[,1010:1200]
+t %>% as_tibble(rownames = "gene") %>% left_join(., hs_U[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(hs_genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group, -genetype, key = bin, value = content) %>% filter(genetype == "ALE") %>% mutate(group = ifelse(group == "NR", "Bypassed ALE PAS (269)", "Unbypassed ALE PAS (789)")) %>% ggline(x = "bin", y = "content", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human ALE U content", xlab = "position downstream to polyA site", ylab = "U frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.34)  + scale_x_discrete(breaks=c(25,75,125,175)) + stat_summary(aes(x=bin,y=content, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+t %>% as_tibble(rownames = "gene") %>% left_join(., hs_U[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(hs_genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group,-genetype, key = bin, value = content) %>% filter(genetype == "TUTR") %>% mutate(group = ifelse(group == "NR", "Bypassed TUTR PAS (706)", "Unbypassed TUTR PAS (1993)")) %>% ggline(x = "bin", y = "content", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human TUTR U content", xlab = "position downstream to polyA site", ylab = "U frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.32) + scale_x_discrete(breaks=c(25,75,125,175)) + stat_summary(aes(x=bin,y=content, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+##1000ds
+t <- hs_rolled[,1010:2000]
+t %>% as_tibble(rownames = "gene") %>% left_join(., hs_U[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(hs_genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group, -genetype, key = bin, value = content) %>% filter(genetype == "ALE") %>% mutate(group = ifelse(group == "NR", "Bypassed ALE PAS (269)", "Unbypassed ALE PAS (789)")) %>% ggline(x = "bin", y = "content", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human ALE U content", xlab = "position downstream to polyA site", ylab = "U frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.34)  + scale_x_discrete(breaks=c(150,350,550,750,950)) + stat_summary(aes(x=bin,y=content, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+t %>% as_tibble(rownames = "gene") %>% left_join(., hs_U[,1:2]) %>% mutate(gene = substr(gene, 1, 15)) %>% left_join(hs_genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group,-genetype, key = bin, value = content) %>% filter(genetype == "TUTR") %>% mutate(group = ifelse(group == "NR", "Bypassed TUTR PAS (706)", "Unbypassed TUTR PAS (1993)")) %>% ggline(x = "bin", y = "content", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Human TUTR U content", xlab = "position downstream to polyA site", ylab = "U frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.32) + scale_x_discrete(breaks=c(150,350,550,750,950)) + stat_summary(aes(x=bin,y=content, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+```
+
+##Mouse
+
+```{r, mouse, warning=FALSE}
+
+#faceted rolled
+mm_rolled %>% as_tibble(rownames = "gene") %>% left_join(., mm_U[,1:2]) %>% mutate(gene = substr(gene, 1, 18)) %>% left_join(mm_genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group,-genetype, key = bin, value = content) %>% filter(genetype != "mixed") %>% ggline(x = "bin", y = "content", color = "group", add = "mean", size = 1.5, title = "Mouse U content rolling average", xlab = "Position around PAS", ylab = "U Frequency (%)", facet.by = "genetype") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = 0.33) +  scale_x_discrete(breaks=c(-950,-750,-550,-350,-150,150,350,550,750,950)) + facet_wrap(.~genetype, nrow = 2) + theme(strip.background = element_rect(color = "white", fill = "white"), strip.text.x = element_text(size = 12, color = "Black", face = "bold")) + stat_summary(aes(x=bin,y=content, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Blue", "Red")) + scale_fill_manual(values = c("Red", "Blue"))
+
+#$200ds
+t <- mm_rolled[,1010:1200]
+t %>% as_tibble(rownames = "gene") %>% left_join(., mm_U[,1:2]) %>% mutate(gene = substr(gene, 1, 18)) %>% left_join(mm_genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group, -genetype, key = bin, value = content) %>% filter(genetype == "ALE") %>% mutate(group = ifelse(group == "NR", "Bypassed ALE PAS (276)", "Unbypassed ALE PAS (505)")) %>% ggline(x = "bin", y = "content", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Mouse ALE U content", xlab = "position downstream to polyA site", ylab = "U frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.335) + scale_x_discrete(breaks=c(25,75,125,175)) + stat_summary(aes(x=bin,y=content, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+t %>% as_tibble(rownames = "gene") %>% left_join(., mm_U[,1:2]) %>% mutate(gene = substr(gene, 1, 18)) %>% left_join(mm_genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group,-genetype, key = bin, value = content) %>% filter(genetype == "TUTR") %>% mutate(group = ifelse(group == "NR", "Bypassed TUTR PAS (665)", "Unbypassed TUTR PAS (1376)")) %>% ggline(x = "bin", y = "content", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Mouse TUTR U content", xlab = "position downstream to polyA site", ylab = "U frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.31) + scale_x_discrete(breaks=c(25,75,125,175)) + stat_summary(aes(x=bin,y=content, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+##1000ds
+t <- mm_rolled[,1010:2000]
+t %>% as_tibble(rownames = "gene") %>% left_join(., mm_U[,1:2]) %>% mutate(gene = substr(gene, 1, 18)) %>% left_join(mm_genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group, -genetype, key = bin, value = content) %>% filter(genetype == "ALE") %>% mutate(group = ifelse(group == "NR", "Bypassed ALE PAS (276)", "Unbypassed ALE PAS (505)")) %>% ggline(x = "bin", y = "content", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Mouse ALE U content", xlab = "position downstream to polyA site", ylab = "U frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.335) + scale_x_discrete(breaks=c(150,350,550,750,950)) + stat_summary(aes(x=bin,y=content, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+t %>% as_tibble(rownames = "gene") %>% left_join(., mm_U[,1:2]) %>% mutate(gene = substr(gene, 1, 18)) %>% left_join(mm_genetypes, by = c("gene" = "Gene")) %>% gather(-gene, -group,-genetype, key = bin, value = content) %>% filter(genetype == "TUTR") %>% mutate(group = ifelse(group == "NR", "Bypassed TUTR PAS (665)", "Unbypassed TUTR PAS (1376)")) %>% ggline(x = "bin", y = "content", color = "group", add = "mean", plot_type = "b", size = 1.25, point.size = 1, title = "Mouse TUTR U content", xlab = "position downstream to polyA site", ylab = "U frequency (%)") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", size = 5, hide.ns = TRUE, label.y = 0.31) + scale_x_discrete(breaks=c(150,350,550,750,950)) + stat_summary(aes(x=bin,y=content, fill = group, color = group, group=group), geom="ribbon", fun.data = mean_cl_normal, fun.args=list(conf.int=0.95),alpha = 0.2,color = NA) + scale_color_manual(values = c("Red", "Blue")) + scale_fill_manual(values = c("Red", "Blue"))
+
+```
+
+##Now for single UTR PAS seq analysis
+
+```{r, get polya UTR gff, echo = FALSE}
+##prepare polya gff
+polya_gff <- rtracklayer::import("/Users/rgoer/Documents/PsiExpCorr/data/uniqueutrcoords.gff") #import
+polya_gff <- polya_gff[!grepl("_PAR_Y", polya_gff$ID)] #remove weird Y chromosome haplotype (>10 genes)
+
+#only interested in genes with one UTR (this is true for ~50% of genes)
+oneUTRids <- polya_gff %>% 
+  as_tibble() %>% 
+  filter(type == "uniqueUTR", 
+         number_of_uniqueseqs == 1) %>% 
+  mutate(tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2],
+                         "_uniqueUTR",
+                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4],
+                         sep = "")) %>% 
+  pull(., tx_name)
+
+
+##make txdb object
+##first create transcripts, splicings and gene dataframes with required functions
+transcripts <- polya_gff %>% 
+  as_tibble() %>% 
+  filter(type == "uniqueUTR") %>% 
+  mutate(tx_id = as.integer(paste(str_match(ID, "ENSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,2], 
+                                  str_match(ID, "ENSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,3], 
+                                  str_match(ID, "ENSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+                                  sep = "")), 
+         tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2], 
+                         "_uniqueUTR", 
+                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+                         sep = "")) %>% 
+  dplyr::rename("tx_chrom" = seqnames, 
+                "tx_strand" = strand, 
+                "tx_start" = start, 
+                "tx_end" = end) %>% 
+  dplyr::select(tx_chrom, tx_start, tx_end, tx_strand, tx_id, tx_name) %>% 
+  filter(tx_name %in% twoUTRids)
+
+splicings <- polya_gff %>% 
+  as_tibble() %>% 
+  filter(type == "uniqueUTRexon") %>% 
+  mutate(tx_id = as.integer(paste(str_match(ID, "ENSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,2],
+                                  str_match(ID, "ENSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,3], 
+                                  str_match(ID, "ENSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+                                  sep = "")), 
+         tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2], 
+                         "_uniqueUTR", 
+                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4],
+                         sep = ""),
+         exon_rank = as.integer(str_match(ID, "ENSG(.*?)\\.(.*?)_uniqueUTR(.?)_exon(.*)")[,5])) %>% 
+  dplyr::rename("exon_start" = start, 
+                "exon_end" = end)  %>% 
+  filter(tx_name %in% twoUTRids) %>% 
+  dplyr::select(exon_start, exon_end, tx_id, exon_rank)
+
+genes <- polya_gff %>%
+  as_tibble() %>% 
+  filter(type == "uniqueUTR") %>%
+  mutate(gene_id = substr(ID, 1, 15), 
+         tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2],
+                         "_uniqueUTR", 
+                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+                         sep = "")) %>% 
+  dplyr::select(tx_name, gene_id) %>% 
+  filter(tx_name %in% twoUTRids)
+
+##Make the actual TxDb object
+hs_oneUTR_polya_gff_txdb <- makeTxDb(transcripts, splicings, genes)
+seqlevelsStyle(hs_oneUTR_polya_gff_txdb) <- "NCBI"
+
+saveDb(hs_oneUTR_polya_gff_txdb, file="oneUTR_polya_gff_txdb.sqlite")
+
+hs_oneUTR_polya_gff_txdb <- loadDb("oneUTR_polya_gff_txdb.sqlite")
+seqlevelsStyle(hs_oneUTR_polya_gff_txdb) <- "NCBI"
+```
+
+```{r, make mouse unique utr coods txdb, echo = FALSE}
+
+##prepare polya gff
+polya_gff <- rtracklayer::import("/Users/rgoer/Documents/PsiExpCorr/data/uniqueutrcoords.gencodecomprehensive.vM17.gff3")
+
+#only interested in genes with two alternative UTRs (this is true for ~50% of genes)
+twoUTRids <- polya_gff %>% 
+  as_tibble() %>% 
+  filter(type == "uniqueUTR", 
+         number_of_uniqueseqs == 1) %>% 
+  mutate(tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2],
+                         "_uniqueUTR",
+                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4],
+                         sep = "")) %>% 
+  pull(., tx_name)
+
+
+##make txdb object
+##first create transcripts, splicings and gene dataframes with required functions
+#transcripts <- polya_gff %>% 
+#  as_tibble() %>% 
+#  filter(type == "uniqueUTR") %>% 
+#  mutate(tx_id = as.integer(paste(str_match(ID, "ENSMUSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,2], 
+#                                  str_match(ID, "ENSMUSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,3], 
+#                                  str_match(ID, "ENSMUSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+#                                  sep = "")), 
+#         tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2], 
+#                         "_uniqueUTR", 
+#                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+#                         sep = "")) %>% 
+#  dplyr::rename("tx_chrom" = seqnames, 
+#                "tx_strand" = strand, 
+#                "tx_start" = start, 
+#                "tx_end" = end) %>% 
+#  dplyr::select(tx_chrom, tx_start, tx_end, tx_strand, tx_id, tx_name) %>% 
+#  filter(tx_name %in% twoUTRids)
+
+#splicings <- polya_gff %>% 
+#  as_tibble() %>% 
+#  filter(type == "uniqueUTRexon") %>% 
+#  mutate(tx_id = as.integer(paste(str_match(ID, "ENSMUSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,2],
+#                                  str_match(ID, "ENSMUSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,3], 
+#                                  str_match(ID, "ENSMUSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+#                                  sep = "")), 
+#         tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2], 
+#                         "_uniqueUTR", 
+#                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4],
+#                         sep = ""),
+#         exon_rank = as.integer(str_match(ID, "ENSMUSG(.*?)\\.(.*?)_uniqueUTR(.?)_exon(.*)")[,5])) %>% 
+#  dplyr::rename("exon_start" = start, 
+#                "exon_end" = end)  %>% 
+#  filter(tx_name %in% twoUTRids) %>% 
+#  dplyr::select(exon_start, exon_end, tx_id, exon_rank)
+
+#genes <- polya_gff %>%
+#  as_tibble() %>% 
+#  filter(type == "uniqueUTR") %>%
+#  mutate(gene_id = substr(ID, 1, 18), 
+#         tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2],
+#                         "_uniqueUTR", 
+#                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+#                         sep = "")) %>% 
+#  dplyr::select(tx_name, gene_id) %>% 
+#  filter(tx_name %in% twoUTRids)
+
+##Make the actual TxDb object
+#polya_gff_txdb <- makeTxDb(transcripts, splicings, genes)
+
+#saveDb(polya_gff_txdb, file="twoUTR_polya_mm_gff_txdb.sqlite")
+```

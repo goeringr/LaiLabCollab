@@ -1,0 +1,1416 @@
+---
+title: "Sequence Analysis of Neurally Restricted Long Isoforms"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(BSgenome.Hsapiens.NCBI.GRCh38)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(GenomicFeatures)
+library(RNAreachR)
+library(cowplot)
+library(ggpubr)
+library(UpSetR)
+```
+
+```{r, metagene_Fx}
+
+metagene_nt <- function(DNAStringSet1, DNAStringSet2, Nt, grp1, grp2, title){
+  
+  bin10_NtContent <- function(DNAStringset, Nt, x){
+    y <- letterFrequencyInSlidingView(DNAStringset[[x]], 1, Nt)
+    
+    bin_size <- rep(length(y) %/% 10, 10)
+    bin_size <- bin_size + ifelse(1:10 <= length(y) %% 10, 1, 0)
+    
+    bins <- lapply(c(1:10), function(y) rep(y, bin_size[y])) %>% unlist
+    
+    z <- letterFrequencyInSlidingView(DNAStringset[[x]], 1, Nt) %>%
+      as_tibble() %>%
+      dplyr::rename("nt_content" = 1) %>% 
+      mutate(bin = bins) %>%
+      group_by(bin) %>%
+      summarize(content = mean(nt_content, na.rm = TRUE), .groups = "drop")
+  
+    return(z)
+    
+  }
+  
+  m <- c(1:length(DNAStringSet1))
+  list1 <- lapply(m, function(m) bin10_NtContent(DNAStringSet1, Nt, m))
+  one <- bind_rows(list1, .id = "seq") %>% mutate(bin = as.character(bin), group = !!grp1)
+  
+  
+  n <- c(1:length(DNAStringSet2))
+  list2 <- lapply(n, function(n) bin10_NtContent(DNAStringSet2, Nt, n))
+  two <- bind_rows(list2, .id = "seq") %>% mutate(bin = as.character(bin), group = !!grp2)
+
+  y_label <- rbind(one, two) %>% group_by(bin, group) %>% summarize(mean = mean(content), .groups = "drop") %>% pull(mean) %>% max()
+  
+  p <- rbind(one, two) %>% ggline(x = "bin", y = "content", color = "group", add = "mean_se", size = 1.5, title = title) + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y = y_label + 0.02)
+  
+  return(p)
+}
+
+```
+
+## Extract UTR sequences for genes of interest
+The first step is to load txdb objects containing unique UTR coordinates of genes with two isoforms (long and short). Matt Taliaferro has has generated these for both mouse and human.
+If the UTRs contain overlapping sequence (tandem UTRs), this sequence is only represented in the shorter isoform. The longer isoform has only the extended, unique sequence.
+
+```{r, txdb objects}
+hspolya_txdb <- AnnotationDbi::loadDb("psidat/twoUTR_polya_gff_txdb.sqlite")
+seqlevelsStyle(hspolya_txdb) <- "NCBI"
+mmpolya_txdb <- AnnotationDbi::loadDb("psidat/twoUTR_polya_mm_gff_txdb.sqlite")
+
+mm_genetype <- read.table("psidat/mouse_genetype_table.txt", header = TRUE)
+hs_genetype <- read.table("psidat/human_genetype_table.txt", header = TRUE)
+genetypes <- rbind(mm_genetype, hs_genetype) %>% as_tibble()
+```
+
+Genes were defined to be Neurally restricted (NR) based on their psi values as calculated by LABRAT. This is detailed in a different document. Each set of NR genes (mouse, human and conserved) have their own control set of genes. The control genes are other genes expresed in brain tissue but do not favor usage of a long isoform or that long isoform is not brain specific. Conserved genes are the overlap between two human and mouse NR gene sets. 
+
+```{r, gene lists}
+mm_NR_genes <- readRDS("psidat/mm_NR_genes.txt")
+mm_ctrl_genes <- readRDS("psidat/mm_ctrl_genes.txt")
+hs_NR_genes <- readRDS("psidat/hs_NR_genes.txt")
+hs_ctrl_genes <- readRDS("psidat/hs_ctrl_genes.txt")
+cs_NR_genes <- readRDS("psidat/cs_NR_genes.txt")
+cs_ctrl_genes <- readRDS("psidat/cs_ctrl_genes.txt")
+
+# appending text to gene names to interface with txdb objects easily
+mm_prox_genes <- unlist(lapply(mm_NR_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+mm_dist_genes <- unlist(lapply(mm_NR_genes, function(x) paste(x, "_uniqueUTR1", sep = "")))
+mm_ctrl_prox_genes <- unlist(lapply(mm_ctrl_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+mm_ctrl_dist_genes <- unlist(lapply(mm_ctrl_genes, function(x) paste(x, "_uniqueUTR1", sep = "")))
+
+hs_prox_genes <- unlist(lapply(hs_NR_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+hs_dist_genes <- unlist(lapply(hs_NR_genes, function(x) paste(x, "_uniqueUTR1", sep = "")))
+hs_ctrl_prox_genes <- unlist(lapply(hs_ctrl_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+hs_ctrl_dist_genes <- unlist(lapply(hs_ctrl_genes, function(x) paste(x, "_uniqueUTR1", sep = "")))
+
+cs_prox_genes <- unlist(lapply(cs_NR_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+cs_dist_genes <- unlist(lapply(cs_NR_genes, function(x) paste(x, "_uniqueUTR1", sep = "")))
+cs_ctrl_prox_genes <- unlist(lapply(cs_ctrl_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+cs_ctrl_dist_genes <- unlist(lapply(cs_ctrl_genes, function(x) paste(x, "_uniqueUTR1", sep = "")))
+
+```
+
+```{r, make fastas}
+#quick function to extract sequence from mm and hs genomes using the txdb coordinates
+export_seqs <- function(tx_list, file_name, species){
+  
+  if (species == "mm"){
+    
+    tx_gff <- exonsBy(mmpolya_txdb, "tx", use.names = TRUE)
+    tx_gff <- tx_gff[names(tx_gff) %in% tx_list]
+    seq <- extractTranscriptSeqs(Mmusculus, tx_gff)
+    
+  } else if (species == "hs"){
+    
+    tx_gff <- exonsBy(hspolya_txdb, "tx", use.names = TRUE)
+    tx_gff <- tx_gff[names(tx_gff) %in% tx_list]
+    seq <- extractTranscriptSeqs(Hsapiens, tx_gff)
+  
+  }
+  
+  writeXStringSet(seq, paste(file_name, ".fa", sep = ""), format = "fasta")
+  rtracklayer::export(tx_gff, paste(file_name, ".gff3", sep = ""), format = "GFF3")
+}
+
+export_seqs(mm_prox_genes, "psidat/fastas/mm_NR_proximal_UTRs", "mm")
+export_seqs(mm_dist_genes, "psidat/fastas/mm_NR_distal_UTRs", "mm")
+export_seqs(mm_ctrl_prox_genes, "psidat/fastas/mm_ctrl_proximal_UTRs", "mm")
+export_seqs(mm_ctrl_dist_genes, "psidat/fastas/mm_ctrl_distal_UTRs", "mm")
+export_seqs(hs_prox_genes, "psidat/fastas/hs_NR_proximal_UTRs", "hs")
+export_seqs(hs_dist_genes, "psidat/fastas/hs_NR_distal_UTRs", "hs")
+export_seqs(hs_ctrl_prox_genes, "psidat/fastas/hs_ctrl_proximal_UTRs", "hs")
+export_seqs(hs_ctrl_dist_genes, "psidat/fastas/hs_ctrl_distal_UTRs", "hs")
+#export_seqs(cs_prox_genes, "psidat/fastas/cs_NR_proximal_UTRs", "hs")
+#export_seqs(cs_dist_genes, "psidat/fastas/cs_NR_distal_UTRs", "hs")
+#export_seqs(cs_ctrl_prox_genes, "psidat/fastas/cs_ctrl_proximal_UTRs", "hs")
+#export_seqs(cs_ctrl_dist_genes, "psidat/fastas/cs_ctrl_distal_UTRs", "hs")
+
+mm_prox <- readDNAStringSet("psidat/fastas/mm_NR_proximal_UTRs.fa")
+mm_dist <- readDNAStringSet("psidat/fastas/mm_NR_distal_UTRs.fa")
+mm_ctrl_prox <- readDNAStringSet("psidat/fastas/mm_ctrl_proximal_UTRs.fa")
+mm_ctrl_dist <- readDNAStringSet("psidat/fastas/mm_ctrl_distal_UTRs.fa")
+hs_prox <- readDNAStringSet("psidat/fastas/hs_NR_proximal_UTRs.fa")
+hs_dist <- readDNAStringSet("psidat/fastas/hs_NR_distal_UTRs.fa")
+hs_ctrl_prox <- readDNAStringSet("psidat/fastas/hs_ctrl_proximal_UTRs.fa")
+hs_ctrl_dist <- readDNAStringSet("psidat/fastas/hs_ctrl_distal_UTRs.fa")
+cs_prox <- readDNAStringSet("psidat/fastas/cs_NR_proximal_UTRs.fa")
+cs_dist <- readDNAStringSet("psidat/fastas/cs_NR_distal_UTRs.fa")
+cs_ctrl_prox <- readDNAStringSet("psidat/fastas/cs_ctrl_proximal_UTRs.fa")
+cs_ctrl_dist <- readDNAStringSet("psidat/fastas/cs_ctrl_distal_UTRs.fa")
+
+```
+
+## Length
+
+```{r, length prox v dist}
+# mm prox v dist
+mm_length <- get_length(mm_prox) %>% 
+  mutate(gene = substr(gene, 1, 18)) %>% 
+  dplyr::rename("prox" = length) %>% 
+  mutate(dist = get_length(mm_dist)$length) %>% 
+  gather(-gene, key = UTR, value = length)
+
+mm_length_compare <- length_compare(mm_prox, mm_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+mm_length_compare
+
+# mm ctrl prox v dist
+mm_ctrl_length <- get_length(mm_ctrl_prox) %>% 
+  mutate(gene = substr(gene, 1, 18)) %>% 
+  dplyr::rename("prox" = length) %>% 
+  mutate(dist = get_length(mm_ctrl_dist)$length) %>% 
+  gather(-gene, key = UTR, value = length)
+
+mm_ctrl_length_compare <- length_compare(mm_ctrl_prox, mm_ctrl_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+mm_ctrl_length_compare
+
+# hs prox v dist
+hs_length <- get_length(hs_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = length) %>% 
+  mutate(dist = get_length(hs_dist)$length) %>% 
+  gather(-gene, key = UTR, value = length)
+
+hs_length_compare <- length_compare(hs_prox, hs_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+hs_length_compare
+
+# hs ctrl prox v dist
+hs_ctrl_length <- get_length(hs_ctrl_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = length) %>% 
+  mutate(dist = get_length(hs_ctrl_dist)$length) %>% 
+  gather(-gene, key = UTR, value = length)
+
+hs_ctrl_length_compare <- length_compare(hs_ctrl_prox, hs_ctrl_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+hs_ctrl_length_compare
+
+# cs prox v dist
+cs_length <- get_length(cs_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = length) %>% 
+  mutate(dist = get_length(cs_dist)$length) %>% 
+  gather(-gene, key = UTR, value = length)
+
+cs_length_compare <- length_compare(cs_prox, cs_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+cs_length_compare
+
+# cs ctrl prox v dist
+cs_ctrl_length <- get_length(cs_ctrl_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = length) %>% 
+  mutate(dist = get_length(cs_ctrl_dist)$length) %>% 
+  gather(-gene, key = UTR, value = length)
+
+cs_ctrl_length_compare <- length_compare(cs_ctrl_prox, cs_ctrl_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+cs_ctrl_length_compare
+
+# all together now
+all_length_compare <- rbind(mm_length_compare, hs_length_compare) %>% 
+  rbind(., cs_length_compare) %>% 
+  rbind(., mm_ctrl_length_compare) %>% 
+  rbind(., hs_ctrl_length_compare) %>% 
+  rbind(., cs_ctrl_length_compare) %>% 
+  as_tibble() %>% 
+  mutate(group = c("mm", "hs", "cs", "mm_ctrl", "hs_ctrl", "cs_ctrl"))
+
+all_length_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(all_length_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("mm", "hs", "cs", "mm_ctrl", "hs_ctrl", "cs_ctrl")) + 
+  labs(title = "Length of UTRs (Proximal/Distal)",subtitle = "Distal UTRs are always longer than Proximal UTRs, especially so in NR genes", x = "", y = "Cliff's Delta \n (proximal / distal)")
+
+all_len <- mm_length %>% 
+  dplyr::rename("mm" = length) %>% 
+  full_join(., hs_length) %>% 
+  dplyr::rename("hs" = length) %>% 
+  full_join(., cs_length) %>% 
+  dplyr::rename("cs" = length) %>% 
+  full_join(., mm_ctrl_length) %>% 
+  dplyr::rename("mm_ctrl" = length) %>% 
+  full_join(., hs_ctrl_length) %>% 
+  dplyr::rename("hs_ctrl" = length) %>% 
+  full_join(., cs_ctrl_length) %>% 
+  dplyr::rename("cs_ctrl" = length) %>% 
+  gather(-gene, - UTR, key = group, value = length) %>% 
+  separate(group, into = c("species", "group"), sep = "_", fill = "right") %>%
+  mutate(group = ifelse(is.na(group) == TRUE, "NR", group)) %>% 
+  left_join(., genetypes, by = c("gene" = "Gene")) %>% 
+  na.omit()
+
+all_len %>% ggplot(aes(x = UTR, y = length, fill = UTR)) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() +
+  scale_y_continuous(limits = c(0, 7500)) + 
+  facet_grid(group~species) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(title = "Length of UTRs",subtitle = "Distal UTRs are always longer than Proximal UTRs, especially so in NR genes")
+
+# what about UTR types??
+
+all_len %>% filter(species == "mm", genetype != "mixed") %>% 
+  ggplot(aes(x = UTR, y = length, fill = UTR)) +
+  geom_point(position = "jitter", alpha = 0.25) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(group~genetype) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(title = "Mouse UTR length by type", subtitle = "ALE and TUTRs both have longer distal UTRs") +
+  EnvStats::stat_n_text(y.pos = 7000) +
+  scale_y_continuous(limits = c(0, 7500))
+
+all_len %>% filter(species == "hs", genetype != "mixed") %>% 
+  ggplot(aes(x = UTR, y = length, fill = UTR)) +
+  geom_point(position = "jitter", alpha = 0.25) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot()  + 
+  facet_grid(group~genetype) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(title = "Human UTR length by type", subtitle = "ALE and TUTRs both have longer distal UTRs") +
+  EnvStats::stat_n_text(y.pos = 7000) +
+  scale_y_continuous(limits = c(0, 7500))
+
+all_len %>% filter(species == "cs", genetype != "mixed") %>% 
+  ggplot(aes(x = UTR, y = length, fill = UTR)) +
+  geom_point(position = "jitter", alpha = 0.25) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(group~genetype) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(title = "Conserved UTR length by type", subtitle = "ALE and TUTRs both have longer distal UTRs") +
+  EnvStats::stat_n_text(y.pos = 7000) +
+  scale_y_continuous(limits = c(0, 7500))
+
+# proximal UTRs
+mm_prox_length <- length_compare(mm_prox, mm_ctrl_prox) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl,"NR/ctrl" = mean_FC)
+hs_prox_length <- length_compare(hs_prox, hs_ctrl_prox) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl,"NR/ctrl" = mean_FC)
+cs_prox_length <- length_compare(cs_prox, cs_ctrl_prox) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl,"NR/ctrl" = mean_FC) 
+
+mm_prox_length
+hs_prox_length
+cs_prox_length
+
+all_len %>% filter(UTR == "prox") %>% 
+    ggplot(aes(x = group, y = length, fill = group)) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() +
+    scale_y_continuous(limits = c(0, 7500)) + 
+    facet_grid(.~species) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "Proximal UTR length", subtitle = "Proximal UTRs of NR genes are not different from other Proximal UTRs")
+
+all_len %>% filter(UTR == "prox", genetype != "mixed") %>% 
+    ggplot(aes(x = group, y = length, fill = group)) +
+    geom_point(position = "jitter", alpha = 0.25) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() + 
+    facet_grid(genetype~species) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "Proximal UTR length", subtitle = "Proximal UTR type does not influence length") +
+    EnvStats::stat_n_text(y.pos = 7000) +
+    scale_y_continuous(limits = c(0, 7500))
+
+# distal UTRs
+mm_dist_length <- length_compare(mm_dist, mm_ctrl_dist) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl, "NR/ctrl" =  mean_FC)
+hs_dist_length <- length_compare(hs_dist, hs_ctrl_dist) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl, "NR/ctrl" =  mean_FC)
+cs_dist_length <- length_compare(cs_dist, cs_ctrl_dist) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl, "NR/ctrl" =  mean_FC) 
+
+mm_dist_length
+hs_dist_length
+cs_dist_length
+
+all_len %>% filter(UTR == "dist") %>% 
+    ggplot(aes(x = group, y = length, fill = group)) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() +
+    scale_y_continuous(limits = c(0, 7500)) + 
+    facet_grid(.~species) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "Distal UTR length", subtitle = "Distal UTRs of NR genes are longer than expected")
+
+all_len %>% filter(UTR == "dist", genetype != "mixed") %>% 
+    ggplot(aes(x = group, y = length, fill = group)) +
+    geom_point(position = "jitter") +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE)  +
+    theme_cowplot() +
+    scale_y_continuous(limits = c(0, 7500)) + 
+    facet_grid(genetype~species) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "Distal UTR length", subtitle = "Distal TUTRs drive the increased length in NR genes") +
+    EnvStats::stat_n_text(y.pos = 7000) +
+    scale_y_continuous(limits = c(0, 7500))
+
+UTR_length_compare <- rbind(mm_prox_length, mm_dist_length) %>% 
+  rbind(., hs_prox_length) %>% 
+  rbind(., hs_dist_length) %>% 
+  rbind(., cs_prox_length) %>% 
+  rbind(., cs_dist_length) %>% 
+  as_tibble() %>% 
+  mutate(group = c("mm_prox", "mm_dist", "hs_prox", "hs_dist", "cs_prox", "cs_dist"))
+
+UTR_length_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(all_length_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("mm_prox", "mm_dist", "hs_prox", "hs_dist", "cs_prox", "cs_dist")) + 
+  labs(title = "Length of UTRs (NR/ctrl)",subtitle = "Distal UTRs are longer than expected in NR genes", x = "", y = "Cliff's Delta \n (NR / ctrl)")
+
+```
+
+## Length Summary
+
+Generally, Proximal UTRs are shorter than Distal UTRs. This is very expected.
+However, NR genes have longer Distal UTRs than control genes.
+No trend is seen with proximal UTRs.
+Longer distal UTRs in NR genes is driven by Tandem UTR types.
+
+## GC Content
+
+```{r, GC prox v dist}
+# mm prox v dist
+mm_GC <- get_GC(mm_prox) %>% 
+  mutate(gene = substr(gene, 1, 18)) %>% 
+  dplyr::rename("prox" = GC) %>% 
+  mutate(dist = get_GC(mm_dist)$GC) %>% 
+  gather(-gene, key = UTR, value = GC)
+
+mm_GC_compare <- GC_compare(mm_prox, mm_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+mm_GC_compare
+
+# mm_ctrl prox v dist
+mm_ctrl_GC <- get_GC(mm_ctrl_prox) %>% 
+  mutate(gene = substr(gene, 1, 18)) %>% 
+  dplyr::rename("prox" = GC) %>% 
+  mutate(dist = get_GC(mm_ctrl_dist)$GC) %>% 
+  gather(-gene, key = UTR, value = GC)
+
+mm_ctrl_GC_compare <- GC_compare(mm_ctrl_prox, mm_ctrl_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+mm_ctrl_GC_compare
+
+# hs prox v dist
+hs_GC <- get_GC(hs_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = GC) %>% 
+  mutate(dist = get_GC(hs_dist)$GC) %>% 
+  gather(-gene, key = UTR, value = GC)
+
+hs_GC_compare <- GC_compare(hs_prox, hs_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+hs_GC_compare
+
+# hs_ctrl prox v dist
+hs_ctrl_GC <- get_GC(hs_ctrl_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = GC) %>% 
+  mutate(dist = get_GC(hs_ctrl_dist)$GC) %>% 
+  gather(-gene, key = UTR, value = GC)
+
+hs_ctrl_GC_compare <- GC_compare(hs_ctrl_prox, hs_ctrl_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+hs_ctrl_GC_compare
+
+# cs prox v dist
+cs_GC <- get_GC(cs_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = GC) %>% 
+  mutate(dist = get_GC(cs_dist)$GC) %>% 
+  gather(-gene, key = UTR, value = GC)
+
+cs_GC_compare <- GC_compare(cs_prox, cs_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+cs_GC_compare
+
+# cs ctrl prox v dist
+cs_ctrl_GC <- get_GC(cs_ctrl_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = GC) %>% 
+  mutate(dist = get_GC(cs_ctrl_dist)$GC) %>% 
+  gather(-gene, key = UTR, value = GC)
+
+cs_ctrl_GC_compare <- GC_compare(cs_ctrl_prox, cs_ctrl_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+cs_ctrl_GC_compare
+
+# all together now
+all_GC_compare <- rbind(mm_GC_compare, hs_GC_compare) %>% 
+  rbind(., cs_GC_compare) %>% 
+  rbind(., mm_ctrl_GC_compare)%>% 
+  rbind(., hs_ctrl_GC_compare)%>% 
+  rbind(., cs_ctrl_GC_compare) %>% 
+  as_tibble() %>% 
+  mutate(group = c("mm", "hs", "cs", "mm_ctrl", "hs_ctrl", "cs_ctrl"))
+
+all_GC_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(all_GC_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("mm", "hs", "cs", "mm_ctrl", "hs_ctrl", "cs_ctrl")) + 
+  labs(title = "GC content of UTRs (Proximal/Distal)", subtitle = "Proximal UTRs contain more GC than Distal UTRs, this is not observed for NR genes", x = "", y = "Cliff's Delta \n (proximal / distal)")
+
+all_GC <- mm_GC %>% 
+  dplyr::rename("mm" = GC) %>% 
+  full_join(., hs_GC) %>% 
+  dplyr::rename("hs" = GC) %>% 
+  full_join(., cs_GC) %>% 
+  dplyr::rename("cs" = GC) %>% 
+  full_join(., mm_ctrl_GC) %>% 
+  dplyr::rename("mm_ctrl" = GC) %>%
+  full_join(., hs_ctrl_GC) %>% 
+  dplyr::rename("hs_ctrl" = GC) %>%
+  full_join(., cs_ctrl_GC) %>% 
+  dplyr::rename("cs_ctrl" = GC) %>% 
+  gather(-gene, - UTR, key = group, value = GC) %>% 
+  separate(group, into = c("species", "group"), sep = "_", fill = "right") %>%
+  mutate(group = ifelse(is.na(group) == TRUE, "NR", group)) %>% 
+  left_join(., genetypes, by = c("gene" = "Gene")) %>% 
+  na.omit()
+
+all_GC %>% 
+  ggplot(aes(x = UTR, y = GC, fill = UTR)) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(group~species) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(title = "GC content of UTRs", subtitle = "Proximal and Distal UTRs of NR genes do not differ in GC content as expected")
+
+# what about UTR types??
+
+all_GC %>%
+  filter(species == "mm", genetype != "mixed") %>% 
+  ggplot(aes(x = UTR, y = GC, fill = UTR)) +
+  geom_point(position = "jitter", alpha = 0.25) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(group~genetype) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(title = "Mouse UTR GC content by type", subtitle = "TUTRs drive this lower GC content in Proxial UTRs however, ALEs do not fit this trend") +
+  EnvStats::stat_n_text()
+  
+all_GC %>%
+  filter(species == "hs", genetype != "mixed") %>% 
+  ggplot(aes(x = UTR, y = GC, fill = UTR)) +
+  geom_point(position = "jitter", alpha = 0.25) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(group~genetype) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(title = "Human UTR GC content by type", subtitle = "NR proximal and distal UTRs do have the same GC content as ctrl genes") +
+  EnvStats::stat_n_text()
+  
+all_GC %>%
+  filter(species == "cs", genetype != "mixed") %>% 
+  ggplot(aes(x = UTR, y = GC, fill = UTR)) +
+  geom_point(position = "jitter", alpha = 0.25) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(group~genetype) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(title = "Conserved UTR GC content by type", subtitle = "NR proximal and distal UTRs do have the same GC content as ctrl genes") +
+  EnvStats::stat_n_text()
+
+######
+all_GC %>%
+  filter(genetype == "TUTR") %>% 
+  ggplot(aes(x = group, y = GC, fill = group)) + 
+  geom_point(position = "jitter", alpha = 0.25) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) +
+  stat_compare_means(method = "wilcox.test") +
+  facet_grid(UTR~species) +
+  theme_cowplot() +
+  guides(fill = FALSE) +
+  EnvStats::stat_n_text() +
+  labs(title = "GC content of TUTRs", subtitle = "Proximal TUTRs of NR genes has lower GC content than expected")
+
+all_GC %>%
+  filter(genetype == "ALE") %>% 
+  ggplot(aes(x = group, y = GC, fill = group)) + 
+  geom_point(position = "jitter", alpha = 0.25) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) +
+  stat_compare_means(method = "wilcox.test") +
+  facet_grid(UTR~species) +
+  theme_cowplot() +
+  guides(fill = FALSE) +
+  EnvStats::stat_n_text() +
+  labs(title = "GC content of ALE UTRs", subtitle = "ALE UTRs of NR genes do not differ from controls in GC content")
+
+#####
+
+
+# proximal UTRs
+mm_prox_GC <- GC_compare(mm_prox, mm_ctrl_prox) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl,"NR/ctrl" = mean_FC)  
+hs_prox_GC <- GC_compare(hs_prox, hs_ctrl_prox) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl,"NR/ctrl" = mean_FC)  
+cs_prox_GC <- GC_compare(cs_prox, cs_ctrl_prox) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl,"NR/ctrl" = mean_FC) 
+
+mm_prox_GC
+hs_prox_GC
+cs_prox_GC
+
+all_GC %>% filter(UTR == "prox") %>% 
+    ggplot(aes(x = group, y = GC, fill = group)) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() + 
+    facet_grid(.~species) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "Proximal UTR GC content", subtitle = "Proximal UTRs of NR genes have lower GC content than expected")
+
+all_GC %>% filter(UTR == "prox", genetype != "mixed") %>% 
+    ggplot(aes(x = group, y = GC, fill = group)) +
+    geom_point(position = "jitter", alpha = 0.25) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() + 
+    facet_grid(genetype~species) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    EnvStats::stat_n_text() +
+    labs(x = "", title = "Proximal UTR GC content", subtitle = "lower GC content of proximal NR genes is driven by TUTRs")
+
+# distal UTRs
+mm_dist_GC <- GC_compare(mm_dist, mm_ctrl_dist) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl,"NR/ctrl" = mean_FC)  
+hs_dist_GC <- GC_compare(hs_dist, hs_ctrl_dist) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl,"NR/ctrl" = mean_FC)  
+cs_dist_GC <- GC_compare(cs_dist, cs_ctrl_dist) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl,"NR/ctrl" = mean_FC) 
+
+mm_dist_GC
+hs_dist_GC
+cs_dist_GC
+
+all_GC %>% filter(UTR == "dist") %>% 
+    ggplot(aes(x = group, y = GC, fill = group)) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() + 
+    facet_grid(.~species) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "Distal UTR GC content", subtitle = "Distal UTR GC content of NR genes does not differ from controls \n (conserved genes are inconsistent)")
+
+all_GC %>% filter(UTR == "dist", genetype != "mixed") %>% 
+    ggplot(aes(x = group, y = GC, fill = group)) +
+    geom_point(position = "jitter", alpha = 0.25) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() + 
+    facet_grid(genetype~species) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    EnvStats::stat_n_text() +
+    labs(x = "", title = "Distal UTR GC content", subtitle = "Distal UTR GC content of NR genes does not differ from controls")
+
+UTR_GC_compare <- rbind(mm_prox_GC, mm_dist_GC) %>% 
+  rbind(., hs_prox_GC) %>% 
+  rbind(., hs_dist_GC) %>% 
+  rbind(., cs_prox_GC) %>% 
+  rbind(., cs_dist_GC) %>% 
+  as_tibble() %>% 
+  mutate(group = c("mm_prox", "mm_dist", "hs_prox", "hs_dist", "cs_prox", "cs_dist"))
+
+UTR_GC_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(all_GC_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("mm_prox", "mm_dist", "hs_prox", "hs_dist", "cs_prox", "cs_dist")) + 
+  labs(title = "GC content of UTRs (NR / ctrl)", subtitle = "Proximal UTRs of NR genes have lower GC content than expected", x = "", y = "Cliff's Delta \n (NR / ctrl)")
+
+```
+
+## GC content across UTRs 
+
+```{r, GC metagene}
+metagene_nt(mm_prox, mm_dist, "GC", "Proximal", "Distal", "Mouse NR UTR GC Content")
+metagene_nt(hs_prox, hs_dist, "GC", "Proximal", "Distal", "Human NR UTR GC Content")
+metagene_nt(cs_prox, cs_dist, "GC", "Proximal", "Distal", "Conserved NR UTR GC Content")
+
+metagene_nt(mm_prox, mm_ctrl_prox, "GC", "NR", "ctrl", "Mouse NRvCtrl Proximal UTR GC Content")
+metagene_nt(mm_dist, mm_ctrl_dist, "GC", "NR", "ctrl", "Mouse NRvCtrl Distal UTR GC Content")
+metagene_nt(hs_prox, mm_ctrl_prox, "GC", "NR", "ctrl", "Human NRvCtrl Proximal UTR GC Content")
+metagene_nt(hs_dist, mm_ctrl_dist, "GC", "NR", "ctrl", "Human NRvCtrl Distal UTR GC Content")
+metagene_nt(cs_prox, mm_ctrl_prox, "GC", "NR", "ctrl", "Conserved NRvCtrl Proximal UTR GC Content")
+metagene_nt(cs_dist, mm_ctrl_dist, "GC", "NR", "ctrl", "Conserved NRvCtrl Distal UTR GC Content")
+
+```
+
+## GC Content Summary
+
+For most genes, proximal UTRs are more GC rich than distal UTRs
+The opposite trend is seen for NR genes (Distal UTRs are more GC rich than proximal) however, this isnt significant.
+Proximal UTRs of NR genes have significantly lower GC content than expected. __This is driven by tandem UTRs.__
+The Distal UTRs of NR genes are not very different in GC content from ctrl genes.
+All ALE UTRs of NR genes are not very different in GC content from ctrl genes.
+
+## U Content
+
+```{r, U prox v dist}
+get_U <- function(DNAStringSet){
+  U <- data.frame(gene = names(DNAStringSet),
+                   U = Biostrings::letterFrequency(DNAStringSet, "T") / Biostrings::width(DNAStringSet)) %>%
+    dplyr::as_tibble() %>%
+    dplyr::rename(U = T)
+  return(U)
+}
+
+U_compare <- function(caseDNAStringSet, ctrlDNAStringSet){
+
+  if (any(names(caseDNAStringSet) %in% names(ctrlDNAStringSet))){
+    warning("some sequences in case set are also in the control set. This is not recommended.")
+  }
+
+  U_case <- Biostrings::letterFrequency(caseDNAStringSet, "T") / Biostrings::width(caseDNAStringSet)
+  U_ctrl <- Biostrings::letterFrequency(ctrlDNAStringSet, "T") / Biostrings::width(ctrlDNAStringSet)
+  wilcox.p <- wilcox.test(U_case, U_ctrl)$p.value
+  mean_case <- mean(U_case)
+  mean_ctrl <- mean(U_ctrl)
+  mean_FC <- mean_case/mean_ctrl
+  CliffDelta <- effsize::cliff.delta(U_case, U_ctrl)$estimate
+  lowerCD <- effsize::cliff.delta(U_case, U_ctrl)$conf.int[1]
+  upperCD <- effsize::cliff.delta(U_case, U_ctrl)$conf.int[2]
+
+  data.frame(wilcox.p, mean_case, mean_ctrl, mean_FC, CliffDelta, lowerCD, upperCD)
+}
+
+# mm prox v dist
+mm_U <- get_U(mm_prox) %>% 
+  mutate(gene = substr(gene, 1, 18)) %>% 
+  dplyr::rename("prox" = U) %>% 
+  mutate(dist = get_U(mm_dist)$U) %>% 
+  gather(-gene, key = UTR, value = U)
+
+
+mm_U_compare <- U_compare(mm_prox, mm_dist) %>% dplyr::rename("mean_prox" = mean_case , "mean_dist" = mean_ctrl, "prox/dist"= mean_FC)
+mm_U_compare
+
+# mm_ctrl prox v dist
+mm_ctrl_U <- get_U(mm_ctrl_prox) %>% 
+  mutate(gene = substr(gene, 1, 18)) %>% 
+  dplyr::rename("prox" = U) %>% 
+  mutate(dist = get_U(mm_ctrl_dist)$U) %>% 
+  gather(-gene, key = UTR, value = U)
+
+mm_ctrl_U_compare <- U_compare(mm_ctrl_prox, mm_ctrl_dist) %>% dplyr::rename("mean_prox" = mean_case , "mean_dist" = mean_ctrl, "prox/dist"= mean_FC)
+mm_ctrl_U_compare
+
+# hs prox v dist
+hs_U <- get_U(hs_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = U) %>% 
+  mutate(dist = get_U(hs_dist)$U) %>% 
+  gather(-gene, key = UTR, value = U)
+
+hs_U_compare <- U_compare(hs_prox, hs_dist) %>% dplyr::rename("mean_prox" = mean_case , "mean_dist" = mean_ctrl, "prox/dist"= mean_FC)
+hs_U_compare
+
+# hs_ctrl prox v dist
+hs_ctrl_U <- get_U(hs_ctrl_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = U) %>% 
+  mutate(dist = get_U(hs_ctrl_dist)$U) %>% 
+  gather(-gene, key = UTR, value = U)
+
+hs_ctrl_U_compare <- U_compare(hs_ctrl_prox, hs_ctrl_dist) %>% dplyr::rename("mean_prox" = mean_case , "mean_dist" = mean_ctrl, "prox/dist"= mean_FC)
+hs_ctrl_U_compare
+
+# cs prox v dist
+cs_U <- get_U(cs_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = U) %>% 
+  mutate(dist = get_U(cs_dist)$U) %>% 
+  gather(-gene, key = UTR, value = U)
+
+cs_U_compare <- U_compare(cs_prox, cs_dist) %>% dplyr::rename("mean_prox" = mean_case , "mean_dist" = mean_ctrl, "prox/dist"= mean_FC)
+cs_U_compare
+
+# cs ctrl prox v dist
+cs_ctrl_U <- get_U(cs_ctrl_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = U) %>% 
+  mutate(dist = get_U(cs_ctrl_dist)$U) %>% 
+  gather(-gene, key = UTR, value = U)
+
+cs_ctrl_U_compare <- U_compare(cs_ctrl_prox, cs_ctrl_dist) %>% dplyr::rename("mean_prox" = mean_case , "mean_dist" = mean_ctrl, "prox/dist"= mean_FC)
+cs_ctrl_U_compare
+
+# all together now
+all_U_compare <- rbind(mm_U_compare, hs_U_compare) %>% 
+  rbind(., cs_U_compare) %>% 
+  rbind(., mm_ctrl_U_compare)%>% 
+  rbind(., hs_ctrl_U_compare)%>% 
+  rbind(., cs_ctrl_U_compare) %>% 
+  as_tibble() %>% 
+  mutate(group = c("mm", "hs", "cs", "mm_ctrl", "hs_ctrl", "cs_ctrl"))
+
+all_U_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(all_U_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("mm", "hs", "cs", "mm_ctrl", "hs_ctrl", "cs_ctrl")) + 
+  labs(title = "U Content of UTRs", subtitle = "Distal UTRs are usually U rich but this is not as extreme with NR genes", x = "", y = "Cliff's Delta \n (proximal / distal)")
+
+all_U <- mm_U %>% 
+  dplyr::rename("mm" = U) %>% 
+  full_join(., hs_U) %>% 
+  dplyr::rename("hs" = U) %>% 
+  full_join(., cs_U) %>% 
+  dplyr::rename("cs" = U ) %>% 
+  full_join(., mm_ctrl_U) %>% 
+  dplyr::rename("mm_ctrl" = U) %>%
+  full_join(., hs_ctrl_U) %>% 
+  dplyr::rename("hs_ctrl" = U) %>%
+  full_join(., cs_ctrl_U) %>% 
+  dplyr::rename("cs_ctrl" = U) %>% 
+  gather(-gene, -UTR, key = group, value = U) %>% 
+  separate(group, into = c("species", "group"), sep = "_", fill = "right") %>%
+  mutate(group = ifelse(is.na(group) == TRUE, "NR", group)) %>% 
+  left_join(., genetypes, by = c("gene" = "Gene")) %>% 
+  na.omit()
+
+all_U %>% 
+  ggplot(aes(x = UTR, y = U, fill = UTR)) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(group~species) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(title = "U content of UTRs", subtitle = "Distal UTRs are more U rich but not for NR genes")
+
+# what about UTR types??
+
+all_U %>% 
+  filter(species == "mm", genetype != "mixed") %>% 
+  ggplot(aes(x = UTR, y = U, fill = UTR)) +
+  geom_point(position = "jitter", alpha = 0.25) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(group~genetype) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(title = "Mouse UTR U content by type", subtitle = "U content of UTRs is different for TUTRs and ALEs") +
+  EnvStats::stat_n_text()
+
+all_U %>% 
+  filter(species == "hs", genetype != "mixed") %>% 
+  ggplot(aes(x = UTR, y = U, fill = UTR)) +
+  geom_point(position = "jitter", alpha = 0.25) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(group~genetype) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(title = "Human UTR U content by type", subtitle = "U content of UTRs is different for TUTRs and ALEs") +
+  EnvStats::stat_n_text()
+
+all_U %>% 
+  filter(species == "cs", genetype != "mixed") %>% 
+  ggplot(aes(x = UTR, y = U, fill = UTR)) +
+  geom_point(position = "jitter", alpha = 0.25) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_grid(group~genetype) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  labs(title = "Conserved UTR U content by type", subtitle = "U content of UTRs is different for TUTRs and ALEs") +
+  EnvStats::stat_n_text()
+
+######
+all_U %>%
+  filter(genetype == "TUTR") %>% 
+  ggplot(aes(x = group, y = U, fill = group)) + 
+  geom_point(position = "jitter", alpha = 0.25) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) +
+  stat_compare_means(method = "wilcox.test") +
+  facet_grid(UTR~species) +
+  theme_cowplot() +
+  guides(fill = FALSE) +
+  EnvStats::stat_n_text() +
+  labs(title = "U content of TUTRs", subtitle = "TUTRs of NR genes overall contain more Us than expected")
+
+all_U %>%
+  filter(genetype == "ALE") %>% 
+  ggplot(aes(x = group, y = U, fill = group)) + 
+  geom_point(position = "jitter", alpha = 0.25) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) +
+  stat_compare_means(method = "wilcox.test") +
+  facet_grid(UTR~species) +
+  theme_cowplot() +
+  guides(fill = FALSE) +
+  EnvStats::stat_n_text() +
+  labs(title = "U content of ALE UTRs", subtitle = "ALE UTRs of NR genes do not differ from controls in U content")
+
+#####
+
+# proximal UTRs
+mm_prox_U <- U_compare(mm_prox, mm_ctrl_prox) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl, "NR/ctrl" = mean_FC)  
+hs_prox_U <- U_compare(hs_prox, hs_ctrl_prox) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl, "NR/ctrl" = mean_FC)  
+cs_prox_U <- U_compare(cs_prox, cs_ctrl_prox) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl, "NR/ctrl" = mean_FC) 
+
+mm_prox_U
+hs_prox_U
+cs_prox_U
+
+all_U %>% filter(UTR == "prox") %>% 
+    ggplot(aes(x = group, y = U, fill = group)) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() + 
+    facet_grid(.~species) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "Proximal UTR U content", subtitle = "NR Proximmal UTRs are more U rich than expected")
+
+all_U %>% filter(UTR == "prox", genetype != "mixed") %>% 
+    ggplot(aes(x = group, y = U, fill = group)) +
+    geom_point(position = "jitter", alpha = 0.25) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() + 
+    facet_grid(genetype~species) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "Proximal UTR U content", subtitle = "higher U content of Proximal NR UTRs is driven by TUTRs") +
+    EnvStats::stat_n_text()
+
+# distal UTRs
+mm_dist_U <- U_compare(mm_dist, mm_ctrl_dist) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl, "NR/ctrl" = mean_FC)  
+hs_dist_U <- U_compare(hs_dist, hs_ctrl_dist) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl, "NR/ctrl" = mean_FC)  
+cs_dist_U <- U_compare(cs_dist, cs_ctrl_dist) %>% dplyr::rename("mean_NR" = mean_case, "ctrl" = mean_ctrl, "NR/ctrl" = mean_FC) 
+
+mm_dist_U
+hs_dist_U
+cs_dist_U
+
+all_U %>% filter(UTR == "dist") %>% 
+    ggplot(aes(x = group, y = U, fill = group)) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() + 
+    facet_grid(.~species) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "Distal UTR U content", subtitle = "Distal UTRs of NR genes are more U rich than expected \n (Human genes are inconsistent)")
+
+all_U %>% filter(UTR == "dist", genetype != "mixed") %>% 
+    ggplot(aes(x = group, y = U, fill = group)) +
+    geom_point(position = "jitter", alpha = 0.25) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+    theme_cowplot() + 
+    facet_grid(genetype~species) + 
+    stat_compare_means(method = "wilcox.test") +
+    guides(fill = FALSE) +
+    labs(x = "", title = "Distal UTR U content", subtitle = "higher U content of Distal NR UTRs is driven by TUTRs \n (Human genes are inconsistent)") +
+    EnvStats::stat_n_text()
+
+UTR_U_compare <- rbind(mm_prox_U, mm_dist_U) %>% 
+  rbind(., hs_prox_U) %>% 
+  rbind(., hs_dist_U) %>% 
+  rbind(., cs_prox_U) %>% 
+  rbind(., cs_dist_U) %>% 
+  as_tibble() %>% 
+  mutate(group = c("mm_prox", "mm_dist", "hs_prox", "hs_dist", "cs_prox", "cs_dist"))
+
+UTR_U_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(all_U_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("mm_prox", "mm_dist", "hs_prox", "hs_dist", "cs_prox", "cs_dist")) + 
+  labs(title = "U Content of UTRs", subtitle = "Overall, NR UTRs are U rich", x = "", y = "Cliff's Delta \n (NR / ctrl)")
+```
+
+## U content across UTRs
+
+```{r, U content metagene}
+# all UTR types together
+metagene_nt(mm_prox, mm_dist, "T", "Proximal", "Distal", "Mouse NR UTR U Content")
+metagene_nt(hs_prox, hs_dist, "T", "Proximal", "Distal", "Human NR UTR U Content")
+metagene_nt(cs_prox, cs_dist, "T", "Proximal", "Distal", "Conserved NR UTR U Content")
+
+metagene_nt(mm_prox, mm_ctrl_prox, "T", "NR", "ctrl", "Mouse NRvCtrl Proximal UTR T Content")
+metagene_nt(mm_dist, mm_ctrl_dist, "T", "NR", "ctrl", "Mouse NRvCtrl Distal UTR T Content")
+metagene_nt(hs_prox, hs_ctrl_prox, "T", "NR", "ctrl", "Human NRvCtrl Proximal UTR T Content")
+metagene_nt(hs_dist, hs_ctrl_dist, "T", "NR", "ctrl", "Human NRvCtrl Distal UTR T Content")
+metagene_nt(cs_prox, cs_ctrl_prox, "T", "NR", "ctrl", "Conserved NRvCtrl Proximal UTR T Content")
+metagene_nt(cs_dist, cs_ctrl_dist, "T", "NR", "ctrl", "Conserved NRvCtrl Distal UTR T Content")
+
+#Tandem
+metagene_nt(mm_prox[names(mm_prox)[names(mm_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_prox[names(mm_ctrl_prox)[names(mm_ctrl_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Mouse  Proximal TUTR T Content")
+metagene_nt(mm_dist[names(mm_dist)[names(mm_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], mm_ctrl_dist[names(mm_ctrl_dist)[names(mm_ctrl_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Mouse NRvCtrl Distal TUTR T Content")
+metagene_nt(hs_prox[names(hs_prox)[names(hs_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], hs_ctrl_prox[names(hs_ctrl_prox)[names(hs_ctrl_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Human NRvCtrl Proximal TUTR T Content")
+metagene_nt(hs_dist[names(hs_dist)[names(hs_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], hs_ctrl_dist[names(hs_ctrl_dist)[names(hs_ctrl_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Human NRvCtrl Distal TUTR T Content")
+metagene_nt(cs_prox[names(cs_prox)[names(cs_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], cs_ctrl_prox[names(cs_ctrl_prox)[names(cs_ctrl_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Conserved NRvCtrl Proximal TUTR T Content")
+metagene_nt(cs_dist[names(cs_dist)[names(cs_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], cs_ctrl_dist[names(cs_ctrl_dist)[names(cs_ctrl_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Conserved NRvCtrl Distal TUTR T Content")
+
+#ALEs
+metagene_nt(mm_prox[names(mm_prox)[names(mm_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_prox[names(mm_ctrl_prox)[names(mm_ctrl_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Mouse  Proximal ALE T Content")
+metagene_nt(mm_dist[names(mm_dist)[names(mm_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], mm_ctrl_dist[names(mm_ctrl_dist)[names(mm_ctrl_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Mouse NRvCtrl Distal ALE T Content")
+metagene_nt(hs_prox[names(hs_prox)[names(hs_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], hs_ctrl_prox[names(hs_ctrl_prox)[names(hs_ctrl_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Human NRvCtrl Proximal ALE T Content")
+metagene_nt(hs_dist[names(hs_dist)[names(hs_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], hs_ctrl_dist[names(hs_ctrl_dist)[names(hs_ctrl_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Human NRvCtrl Distal ALE T Content")
+metagene_nt(cs_prox[names(cs_prox)[names(cs_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], cs_ctrl_prox[names(cs_ctrl_prox)[names(cs_ctrl_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Conserved NRvCtrl Proximal ALE T Content")
+metagene_nt(cs_dist[names(cs_dist)[names(cs_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], cs_ctrl_dist[names(cs_ctrl_dist)[names(cs_ctrl_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "T", "NR", "ctrl", "Conserved NRvCtrl Distal ALE T Content")
+```
+
+## U content Summary
+Normally, distal UTRs contain more Us than proximal But this trend is not true for NR genes.
+Proximal UTRs of NR genes contain more Us than expected. This is largely driven by Tandem UTRs.
+no trend is seen for distal UTRS of NR genes
+
+Additionally, Distal UTRs of NR genes seem to have much higher U content at the beginning of the distal UTR
+This is only seen with Tandem UTRs.
+ALEs dont show much difference in U content and certainly don't display the same U spike
+However, there may still be U spikes immediately downstream of Proximal ALE PAS but it is not captured here because that sequence is intronic and not part of any UTRs
+
+## Kmer enrichment
+
+```{r, kmer}
+######################
+# mm prox v dist
+mm_kmer <- kmer_compare(mm_prox, mm_dist, 6) %>% 
+  dplyr::rename("dist" = ctrl, "prox" = case, "dist_freq" = ctrl_freq, "prox_freq" = case_freq, "dist_tot" = ctrl_tot, "prox_tot" = case_tot)
+mm_kmer %>% dplyr::rename("log2(prox/dist)" = log2FC)
+kmer_plot(mm_kmer) + labs(x = "log2(prox/dist)", title = "Mouse NR prox v dist")
+
+# mm_ctrl prox v dist
+mm_ctrl_kmer <- kmer_compare(mm_ctrl_prox, mm_ctrl_dist, 6) %>% 
+  dplyr::rename("dist" = ctrl, "prox" = case, "dist_freq" = ctrl_freq, "prox_freq" = case_freq, "dist_tot" = ctrl_tot, "prox_tot" = case_tot)
+mm_ctrl_kmer %>% dplyr::rename("log2(prox/dist)" = log2FC)
+kmer_plot(mm_ctrl_kmer) + labs(x = "log2(prox/dist)", title = "Mouse ctrl prox v dist")
+
+# hs prox v dist
+hs_kmer <- kmer_compare(hs_prox, hs_dist, 6) %>% 
+  dplyr::rename("dist" = ctrl, "prox" = case, "dist_freq" = ctrl_freq, "prox_freq" = case_freq, "dist_tot" = ctrl_tot, "prox_tot" = case_tot)
+hs_kmer %>% dplyr::rename("log2(prox/dist)" = log2FC)
+kmer_plot(hs_kmer) + labs(x = "log2(prox/dist)", title = "Human NR prox v dist")
+
+# ha_ctrl prox v dist
+hs_ctrl_kmer <- kmer_compare(hs_ctrl_prox, hs_ctrl_dist, 6) %>% 
+  dplyr::rename("dist" = ctrl, "prox" = case, "dist_freq" = ctrl_freq, "prox_freq" = case_freq, "dist_tot" = ctrl_tot, "prox_tot" = case_tot)
+hs_ctrl_kmer %>% dplyr::rename("log2(prox/dist)" = log2FC)
+kmer_plot(hs_ctrl_kmer) + labs(x = "log2(prox/dist)", title = "Human ctrl prox v dist")
+
+# cs prox v dist
+cs_kmer <- kmer_compare(cs_prox, cs_dist, 6) %>% 
+  dplyr::rename("dist" = ctrl, "prox" = case, "dist_freq" = ctrl_freq, "prox_freq" = case_freq, "dist_tot" = ctrl_tot, "prox_tot" = case_tot)
+cs_kmer %>% dplyr::rename("log2(prox/dist)" = log2FC)
+kmer_plot(cs_kmer) + labs(x = "log2(prox/dist)", title = "Conserved NR prox v dist")
+
+# ha_ctrl prox v dist
+cs_ctrl_kmer <- kmer_compare(cs_ctrl_prox, cs_ctrl_dist, 6) %>% 
+  dplyr::rename("dist" = ctrl, "prox" = case, "dist_freq" = ctrl_freq, "prox_freq" = case_freq, "dist_tot" = ctrl_tot, "prox_tot" = case_tot)
+cs_ctrl_kmer %>% dplyr::rename("log2(prox/dist)" = log2FC)
+kmer_plot(cs_ctrl_kmer) + labs(x = "log2(prox/dist)", title = "Conserved ctrl prox v dist")
+
+#####################
+
+# mm NR v ctrl
+mm_prox_kmer <- kmer_compare(mm_prox, mm_ctrl_prox, 6) 
+mm_prox_kmer 
+kmer_plot(mm_prox_kmer) + labs(x = "log2(NR/ctrl)", title = "Mouse Proximal NR v ctrl")
+
+mm_dist_kmer <- kmer_compare(mm_dist, mm_ctrl_dist, 6) 
+mm_dist_kmer 
+kmer_plot(mm_dist_kmer) + labs(x = "log2(NR/ctrl)", title = "Mouse Distal NR v ctrl")
+
+# hs NR v ctrl
+hs_prox_kmer <- kmer_compare(hs_prox, hs_ctrl_prox, 6) 
+hs_prox_kmer 
+kmer_plot(hs_prox_kmer) + labs(x = "log2(NR/ctrl)", title = "Human Proximal NR v ctrl")
+
+hs_dist_kmer <- kmer_compare(hs_dist, hs_ctrl_dist, 6) 
+hs_dist_kmer 
+kmer_plot(hs_dist_kmer) + labs(x = "log2(NR/ctrl)", title = "Human Distal NR v ctrl")
+
+# cs NR v ctrl
+cs_prox_kmer <- kmer_compare(cs_prox, cs_ctrl_prox, 6) 
+cs_prox_kmer 
+kmer_plot(cs_prox_kmer) + labs(x = "log2(NR/ctrl)", title = "Conserved Proximal NR v ctrl")
+
+cs_dist_kmer <- kmer_compare(cs_dist, cs_ctrl_dist, 6) 
+cs_dist_kmer 
+kmer_plot(cs_dist_kmer) + labs(x = "log2(NR/ctrl)", title = "Conserved Distal NR v ctrl")
+
+```
+
+```{r,}
+all_kmer <- list(mm_prox_kmer, mm_dist_kmer, hs_prox_kmer, hs_dist_kmer, cs_prox_kmer, cs_dist_kmer)
+names(all_kmer) <- c("mm_prox", "mm_dist", "hs_prox", "hs_dist", "cs_prox", "cs_dist")
+all_kmer <- bind_rows(all_kmer, .id = "sample") %>% separate(sample, into = c("species", "UTR"), sep = "_")
+
+# combine all kmers found to be enriched in any (mm, hs, cs) NR v ctrl comparison
+
+prox_enr <- all_kmer %>% filter(UTR == "prox", log2FC > 0, p_adj < 0.05) %>% group_by(kmer) %>% summarize(n=n()) %>% arrange(desc(n)) %>% pull(kmer) %>% as.character() %>% unique()
+prox_dep <- all_kmer %>% filter(UTR == "prox", log2FC < 0, p_adj < 0.05) %>% group_by(kmer) %>% summarize(n=n()) %>% arrange(desc(n)) %>% pull(kmer) %>% as.character() %>% unique()
+dist_enr <- all_kmer %>% filter(UTR == "dist", log2FC > 0, p_adj < 0.05) %>% group_by(kmer) %>% summarize(n=n()) %>% arrange(desc(n)) %>% pull(kmer) %>% as.character() %>% unique()
+dist_dep <- all_kmer %>% filter(UTR == "dist", log2FC < 0, p_adj < 0.05) %>% group_by(kmer) %>% summarize(n=n()) %>% arrange(desc(n)) %>% pull(kmer) %>% as.character() %>% unique()
+
+#not a lot of overlap in kmers
+upset_dat <-list(prox_enr = prox_enr, prox_dep = prox_dep, dist_enr = dist_enr, dist_dep = dist_dep)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+
+```
+
+## Kmer enrichment Summary 
+
+```{r, fid.width = 20}
+
+kmer2logo(prox_enr, "kmers enriched in proximal UTRs")
+#kmer2tree(prox_dep, "kmers depleted in proximal UTRs")
+kmer2PWM(prox_dep) %>% ggseqlogo::ggseqlogo(method = "prob") + ggtitle("kmers depleted in proximal UTRs")
+kmer2logo(dist_enr, "kmers enriched in distal UTRs")
+kmer2logo(dist_dep, "kmers depleted in distal UTRs")
+
+```
+
+U rich 6mers are enriched in NR genes (both proximal and distal but mostly distal)
+
+## Motif enrichment
+
+```{r, motif}
+# mm NR v ctrl
+#mm_prox_cisbpRNA <- motif_compare(CISBPRNA_mm_PWM, mm_prox, mm_ctrl_prox)
+#saveRDS(mm_prox_cisbpRNA, "psidat/motif_stats/mm_prox_cisbpRNA.txt") 
+mm_prox_cisbpRNA <- readRDS("psidat/motif_stats/mm_prox_cisbpRNA.txt") 
+mm_prox_cisbpRNA <- mm_prox_cisbpRNA %>% separate(motif, into = c("ID", "temp", "motif"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")
+mm_prox_cisbpRNA
+motif_plot(mm_prox_cisbpRNA) + labs(x = "log2(NR/ctrl)", title = "Mouse Proximal NR v ctrl")
+
+#mm_dist_cisbpRNA <- motif_compare(CISBPRNA_mm_PWM, mm_dist, mm_ctrl_dist)  
+#saveRDS(mm_dist_cisbpRNA, "psidat/motif_stats/mm_dist_cisbpRNA.txt")
+mm_dist_cisbpRNA <- readRDS("psidat/motif_stats/mm_dist_cisbpRNA.txt")
+mm_dist_cisbpRNA <- mm_dist_cisbpRNA %>% separate(motif, into = c("ID", "temp", "motif"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")
+mm_dist_cisbpRNA
+motif_plot(mm_dist_cisbpRNA) + labs(x = "log2(NR/ctrl)", title = "Mouse Distal NR v ctrl")
+
+# hs NR v ctrl
+#hs_prox_cisbpRNA <- motif_compare(CISBPRNA_hs_PWM, hs_prox, hs_ctrl_prox)
+#saveRDS(hs_prox_cisbpRNA, "psidat/motif_stats/hs_prox_cisbpRNA.txt") 
+hs_prox_cisbpRNA <- readRDS("psidat/motif_stats/hs_prox_cisbpRNA.txt") 
+hs_prox_cisbpRNA <- hs_prox_cisbpRNA %>% separate(motif, into = c("ID", "temp", "motif"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")
+hs_prox_cisbpRNA
+motif_plot(hs_prox_cisbpRNA) + labs(x = "log2(NR/ctrl)", title = "Human Proximal NR v ctrl")
+
+#hs_dist_cisbpRNA <- motif_compare(CISBPRNA_hs_PWM, hs_dist, hs_ctrl_dist)
+#saveRDS(hs_dist_cisbpRNA, "psidat/motif_stats/hs_dist_cisbpRNA.txt") 
+hs_dist_cisbpRNA <- readRDS("psidat/motif_stats/hs_dist_cisbpRNA.txt") 
+hs_dist_cisbpRNA <- hs_dist_cisbpRNA %>% separate(motif, into = c("ID", "temp", "motif"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")
+hs_dist_cisbpRNA
+motif_plot(hs_dist_cisbpRNA) + labs(x = "log2(NR/ctrl)", title = "Human Distal NR v ctrl")
+
+# cs NR v ctrl
+#cs_prox_cisbpRNA <- motif_compare(CISBPRNA_hs_PWM, cs_prox, cs_ctrl_prox)
+#saveRDS(cs_prox_cisbpRNA, "psidat/motif_stats/cs_prox_cisbpRNA.txt") 
+cs_prox_cisbpRNA <- readRDS("psidat/motif_stats/cs_prox_cisbpRNA.txt") 
+cs_prox_cisbpRNA <- cs_prox_cisbpRNA %>% separate(motif, into = c("ID", "temp", "motif"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")
+cs_prox_cisbpRNA
+motif_plot(cs_prox_cisbpRNA) + labs(x = "log2(NR/ctrl)", title = "Conserved Proximal NR v ctrl")
+
+#cs_dist_cisbpRNA <- motif_compare(CISBPRNA_hs_PWM, cs_dist, cs_ctrl_dist) 
+#saveRDS(cs_dist_cisbpRNA, "psidat/motif_stats/cs_dist_cisbpRNA.txt")
+cs_dist_cisbpRNA <- readRDS("psidat/motif_stats/cs_dist_cisbpRNA.txt")
+cs_dist_cisbpRNA <- cs_dist_cisbpRNA %>% separate(motif, into = c("ID", "temp", "motif"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")
+cs_dist_cisbpRNA
+motif_plot(cs_dist_cisbpRNA) + labs(x = "log2(NR/ctrl)", title = "Conserved Distal NR v ctrl")
+
+###############
+
+# mm NR v ctrl
+#mm_prox_RBNS <- motif_compare(RBNS_PWM, mm_prox, mm_ctrl_prox) 
+#saveRDS(mm_prox_RBNS, "psidat/motif_stats/mm_prox_RBNS.txt")
+mm_prox_RBNS <- readRDS("psidat/motif_stats/mm_prox_RBNS.txt")
+mm_prox_RBNS <- mm_prox_RBNS %>% separate(motif, into = c("motif", "ID", "temp"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")
+mm_prox_RBNS 
+motif_plot(mm_prox_RBNS) + labs(x = "log2(NR/ctrl)", title = "Mouse Proximal NR v ctrl")
+
+#mm_dist_RBNS  <- motif_compare(RBNS_PWM, mm_dist, mm_ctrl_dist) 
+#saveRDS(mm_dist_RBNS, "psidat/motif_stats/mm_dist_RBNS.txt")
+mm_dist_RBNS <- readRDS("psidat/motif_stats/mm_dist_RBNS.txt")
+mm_dist_RBNS <- mm_dist_RBNS %>% separate(motif, into = c("motif", "ID", "temp"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")  
+mm_dist_RBNS
+motif_plot(mm_dist_RBNS) + labs(x = "log2(NR/ctrl)", title = "Mouse Distal NR v ctrl")
+
+# hs NR v ctrl
+#hs_prox_RBNS  <- motif_compare(RBNS_PWM, hs_prox, hs_ctrl_prox) 
+#saveRDS(hs_prox_RBNS, "psidat/motif_stats/hs_prox_RBNS.txt")
+hs_prox_RBNS <- readRDS("psidat/motif_stats/hs_prox_RBNS.txt")
+hs_prox_RBNS <- hs_prox_RBNS %>% separate(motif, into = c("motif", "ID", "temp"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")  
+hs_prox_RBNS
+motif_plot(hs_prox_RBNS) + labs(x = "log2(NR/ctrl)", title = "Human Proximal NR v ctrl")
+
+#hs_dist_RBNS <- motif_compare(RBNS_PWM, hs_dist, hs_ctrl_dist)
+#saveRDS(hs_dist_RBNS, "psidat/motif_stats/hs_dist_RBNS.txt")
+hs_dist_RBNS <- readRDS("psidat/motif_stats/hs_dist_RBNS.txt")
+hs_dist_RBNS <- hs_dist_RBNS %>% separate(motif, into = c("motif", "ID", "temp"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")
+hs_dist_RBNS
+motif_plot(hs_dist_RBNS) + labs(x = "log2(NR/ctrl)", title = "Human Distal NR v ctrl")
+
+# cs NR v ctrl
+#cs_prox_RBNS <- motif_compare(RBNS_PWM, cs_prox, cs_ctrl_prox) 
+#saveRDS(cs_prox_RBNS, "psidat/motif_stats/cs_prox_RBNS.txt")
+cs_prox_RBNS <- readRDS("psidat/motif_stats/cs_prox_RBNS.txt")
+cs_prox_RBNS <- cs_prox_RBNS %>% separate(motif, into = c("motif", "ID", "temp"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_") 
+cs_prox_RBNS
+motif_plot(cs_prox_RBNS) + labs(x = "log2(NR/ctrl)", title = "Conserved Proximal NR v ctrl")
+
+#cs_dist_RBNS <- motif_compare(RBNS_PWM, cs_dist, cs_ctrl_dist) 
+#saveRDS(cs_dist_RBNS, "psidat/motif_stats/cs_dist_RBNS.txt")
+cs_dist_RBNS <- readRDS("psidat/motif_stats/cs_dist_RBNS.txt")
+cs_dist_RBNS <- cs_dist_RBNS %>% separate(motif, into = c("motif", "ID", "temp"), sep = "_") %>% unite(col = "ID", ID, temp, sep = "_")
+cs_dist_RBNS
+motif_plot(cs_dist_RBNS) + labs(x = "log2(NR/ctrl)", title = "Conserved Distal NR v ctrl")
+
+```
+
+```{r, }
+all_cisbpRNA <- list(mm_prox_cisbpRNA, mm_dist_cisbpRNA, hs_prox_cisbpRNA, hs_dist_cisbpRNA, cs_prox_cisbpRNA, cs_dist_cisbpRNA)
+names(all_cisbpRNA) <- c("mm_prox_cisbpRNA", "mm_dist_cisbpRNA", "hs_prox_cisbpRNA", "hs_dist_cisbpRNA", "cs_prox_cisbpRNA", "cs_dist_cisbpRNA")
+all_cisbpRNA <- bind_rows(all_cisbpRNA, .id = "sample") %>% separate(sample, into = c("species", "UTR", "cisbpRNA"), sep = "_") %>% mutate(motif = toupper(motif)) %>% ungroup()
+
+# combine RBPs identified in at least 2 of mm, hs, cs (NR vs ctrl) comparisons
+
+prox_enr <- all_cisbpRNA %>% filter(UTR == "prox", log2FC > 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+prox_dep <- all_cisbpRNA %>% filter(UTR == "prox", log2FC < 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+dist_enr <- all_cisbpRNA %>% filter(UTR == "dist", log2FC > 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+dist_dep <- all_cisbpRNA %>% filter(UTR == "dist", log2FC < 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+
+upset_dat <-list(prox_enr = prox_enr, prox_dep = prox_dep, dist_enr = dist_enr, dist_dep = dist_dep)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+
+```
+
+## CisbpRNA motif summary
+"PCBP4"  "SRSF1"  "RBMX"   "HNRNPL" are generally depleted from NR transcripts (proximal and distal UTRs)
+
+"ELAVL3" "RALY"   "U2AF2"  "PUM1"   "TIA1"   "TIAL1"  are generally enriched for NR transcripts (proximal and distal UTRs)
+
+RBPs enriched in Distal NR UTRs:
+
+"MSI1"   "ELAVL1" "ELAVL2" "A1CF"   "CPEB3"  "CPEB4"  "DAZAP1" "PTBP1"  "RBM41"  "SF3B4"
+ 
+RBPs depleted in Distal NR UTRs:
+
+"RBM4B"   "HNRNPK"  "PABPC4"  "SRSF10"  "SRSF9"   "CELF3"   "EIF4B"   "ESRP2"   "HNRNPH2" "IGF2BP1" "KHDRBS3" "LIN28A"  "MBNL3" "PPRC1"   "RBM5"    "SYNCRIP" "ZC3H10" 
+ 
+RBPs enriched in Proximal NR UTRs:
+
+"PABPC1"  "CELF4"   "KHDRBS2" "PABPC4"
+ 
+RBPs depleted in Proximal NR UTRs:
+
+--
+
+interestingly:
+
+PABPC4 in enriched in proximal NR UTRs while depleted in distal NR UTRs
+
+```{r, }
+all_RBNS <- list(mm_prox_RBNS, mm_dist_RBNS, hs_prox_RBNS, hs_dist_RBNS, cs_prox_RBNS, cs_dist_RBNS)
+names(all_RBNS) <- c("mm_prox_RBNS", "mm_dist_RBNS", "hs_prox_RBNS", "hs_dist_RBNS", "cs_prox_RBNS", "cs_dist_RBNS")
+all_RBNS <- bind_rows(all_RBNS, .id = "sample") %>% separate(sample, into = c("species", "UTR", "RBNS"), sep = "_") %>% ungroup()
+
+prox_enr <- all_RBNS %>% filter(UTR == "prox", log2FC > 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+prox_dep <- all_RBNS %>% filter(UTR == "prox", log2FC < 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+dist_enr <- all_RBNS %>% filter(UTR == "dist", log2FC > 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+dist_dep <- all_RBNS %>% filter(UTR == "dist", log2FC < 0, p_adj < 0.05) %>% group_by(motif) %>% summarize(n=n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% pull(motif) %>% as.character() %>% unique()
+
+upset_dat <-list(prox_enr = prox_enr, prox_dep = prox_dep, dist_enr = dist_enr, dist_dep = dist_dep)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+
+```
+
+## RBNS motif summary
+Generally depleted from NR transcripts (proximal and distal UTRs):
+
+"PCBP2"     "HNRNPF"    "HNRNPK"    "EIF4G2"    "RBM45"     "RBM4B"     "RBM6"      "EWSR1"     "HNRNPA2B1" "ILF2" "PCBP4"     "RBM24"     "SRSF5"     "TAF15"     "ESRP1"     "SRSF9"     "FUS"       "MBNL1"     "SRSF2"
+
+Generally enriched for NR transcripts (proximal and distal UTRs):
+
+"FUBP3"    "HNRNPDL"  "ELAVL4"   "RBM15B"   "TRNAU1AP" "BOLL"     "RBM47"    "ZFP36"    "FUBP1"    "KHDRBS2"  "KHSRP" "PUM1"     "RALY"     "TIA1"
+
+RBPs enriched in Distal NR UTRs:
+
+"HNRNPA0"  "MSI1"     "DAZ3"     "UNK"      "PUF60"    "SF1"      "CPEB1"    "HNRNPC"   "HNRNPCL1" "HNRNPD"   "RBM24" "SFPQ"     "ZCRB1"
+ 
+RBPs depleted in Distal NR UTRs:
+
+"HNRNPH2" "PCBP1"   "RBM23"   "RBM25"   "RBM22"   "SRSF11"  "TARDBP" 
+
+RBPs enriched in Proximal NR UTRs:
+
+"KHDRBS3" "A1CF" 
+
+RBPs depleted in Proximal NR UTRs:
+
+"SRSF4"
+
+__Bolded RBPs have similar behavior according to cisbpRNA motifs__
+
+## Hu Protein Motifs across UTRs
+Do they match with the U spike seen in distal tandem UTRs?
+
+```{r,  Hu metagene}
+Hu_PWM <- c(RBNS_PWM[names(RBNS_PWM)[grepl(names(RBNS_PWM), pattern = "ELAV")]], CISBPRNA_hs_PWM[names(CISBPRNA_hs_PWM)[grepl(names(CISBPRNA_hs_PWM), pattern = "ELAV")]])
+names(Hu_PWM) <- c("RBNS1_ELAVL4", "RBNS2_ELAVL4", "M031_ELAVL1", "M108_ELAVL1", "M112_ELAVL1", "M124_ELAVL3", "M127_ELAVL1", "M232_ELAVL1", "M328_ELAVL2", "M329_ELAVL2", "M330_ELAVL2")
+
+
+metagene_motif <- function(PWM_list, caseDNAStringSet, ctrlDNAStringSet, grp1, grp2, title){
+
+  case_seq_len <- tibble(gene = names(caseDNAStringSet), width = width(caseDNAStringSet))
+  
+   case_list <- lapply(PWM_list, function(x) lapply(caseDNAStringSet, function(y) matchPWM(x,y) %>% data.frame(start = start(.), end = end(.))))
+  case_df <- case_list %>% 
+    unlist(recursive = FALSE) %>% 
+    bind_rows(., .id = "key") %>% 
+    as_tibble() %>% 
+    dplyr::rename("match" = 2) %>% 
+    separate(key, into = c("motif", "RBP", "gene"), extra = "merge") %>%
+    left_join(., case_seq_len) %>% 
+    mutate(pos = round(((end - start)*0.5) + start), 
+           bin = ifelse(pos > 0 & pos <= round(width/10), "1", 
+                        ifelse(pos > round(width/10) & pos <= round(2*width/10), "2", 
+                               ifelse(pos > round(2*width/10) & pos <= round(3*width/10), "3",
+                                      ifelse(pos > round(3*width/10) & pos <= round(4*width/10), "4",
+                                             ifelse(pos > round(4*width/10) & pos <= round(5*width/10), "5", 
+                                                    ifelse(pos > round(5*width/10) & pos <= round(6*width/10), "6", 
+                                                           ifelse(pos >  round(6*width/10) & pos <=  round(7*width/10), "7",
+                                                                  ifelse(pos > round(7*width/10) & pos <= round(8*width/10), "8", 
+                                                                         ifelse(pos > round(8*width/10) & pos <= round(9*width/10), "9", 
+                                                                                ifelse(pos > round(9*width/10) & pos <= round(10*width/10), "10",""))))))))))) %>%
+    group_by(bin, RBP, gene) %>% 
+    summarize(norm_count = n()/width) %>% 
+    mutate(group := !!grp1)
+  
+   ctrl_seq_len <- tibble(gene = names(ctrlDNAStringSet), width = width(ctrlDNAStringSet))
+
+   ctrl_list <- lapply(PWM_list, function(x) lapply(ctrlDNAStringSet, function(y) matchPWM(x,y) %>% data.frame(start = start(.), end = end(.))))
+  ctrl_df <- ctrl_list %>% 
+    unlist(recursive = FALSE) %>% 
+    bind_rows(., .id = "key") %>% 
+    as_tibble() %>% 
+    dplyr::rename("match" = 2) %>% 
+    separate(key, into = c("motif", "RBP", "gene"), extra = "merge") %>%
+    left_join(., ctrl_seq_len) %>% 
+    mutate(pos = round(((end - start)*0.5) + start), 
+           bin = ifelse(pos > 0 & pos <= round(width/10), "1", 
+                        ifelse(pos > round(width/10) & pos <= round(2*width/10), "2", 
+                               ifelse(pos > round(2*width/10) & pos <= round(3*width/10), "3",
+                                      ifelse(pos > round(3*width/10) & pos <= round(4*width/10), "4",
+                                             ifelse(pos > round(4*width/10) & pos <= round(5*width/10), "5", 
+                                                    ifelse(pos > round(5*width/10) & pos <= round(6*width/10), "6", 
+                                                           ifelse(pos >  round(6*width/10) & pos <=  round(7*width/10), "7",
+                                                                  ifelse(pos > round(7*width/10) & pos <= round(8*width/10), "8", 
+                                                                         ifelse(pos > round(8*width/10) & pos <= round(9*width/10), "9", 
+                                                                                ifelse(pos > round(9*width/10) & pos <= round(10*width/10), "10",""))))))))))) %>%
+    group_by(bin, RBP, gene) %>% 
+    summarize(norm_count = n()/width) %>% 
+    mutate(group := !!grp2)
+    
+  hit_df <- rbind(case_df, ctrl_df)  
+  #y_label <- hit_df %>% group_by(bin, group, RBP) %>% summarize(mean = mean(count), .groups = "drop") %>% pull(mean) %>% max()
+  
+    p <- hit_df %>% ggline(x = "bin", y = "norm_count", color = "group", add = "mean_se", size = 1.5, title = title, facet.by = "RBP", scales = "free_y") + stat_compare_means(aes(group = group), label = "p.signif", method = "wilcox.test", hide.ns = TRUE, label.y.npc = 0.15) + scale_x_discrete(limits = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10"))
+ 
+  return(p)
+}
+
+metagene_motif(Hu_PWM, mm_prox, mm_dist, "Proximal", "Distal", "Mouse NR genes")
+metagene_motif(Hu_PWM, mm_prox, mm_ctrl_prox, "NR", "ctrl", "Mouse Proximal NRvCtrl")
+metagene_motif(Hu_PWM, mm_dist, mm_ctrl_dist, "NR", "ctrl", "Mouse Distal NRvCtrl")
+
+metagene_motif(Hu_PWM, hs_prox, hs_dist, "Proximal", "Distal", "Human NR genes")
+metagene_motif(Hu_PWM, hs_prox, hs_ctrl_prox, "NR", "ctrl", "Human Proximal NRvCtrl")
+metagene_motif(Hu_PWM, hs_dist, hs_ctrl_dist, "NR", "ctrl", "Human Distal NRvCtrl")
+
+#metagene_motif(Hu_PWM, cs_prox, cs_dist, "Proximal", "Distal", "Conserved NR genes")
+#metagene_motif(Hu_PWM, cs_prox, cs_ctrl_prox, "NR", "ctrl", "Conserved Proximal NRvCtrl")
+#metagene_motif(Hu_PWM, cs_dist, cs_ctrl_dist, "NR", "ctrl", "Conserved Distal NRvCtrl")
+
+#Tandem
+metagene_motif(Hu_PWM, mm_prox[names(mm_prox)[names(mm_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_prox[names(mm_ctrl_prox)[names(mm_ctrl_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "NR", "ctrl", "Mouse  Proximal TUTR Hu Motif Content")
+metagene_motif(Hu_PWM, mm_dist[names(mm_dist)[names(mm_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], mm_ctrl_dist[names(mm_ctrl_dist)[names(mm_ctrl_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "NR", "ctrl", "Mouse NRvCtrl Distal TUTR Hu Motif Content")
+metagene_motif(Hu_PWM, hs_prox[names(hs_prox)[names(hs_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], hs_ctrl_prox[names(hs_ctrl_prox)[names(hs_ctrl_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "NR", "ctrl", "Human NRvCtrl Proximal TUTR Hu Motif Content")
+metagene_motif(Hu_PWM, hs_dist[names(hs_dist)[names(hs_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], hs_ctrl_dist[names(hs_ctrl_dist)[names(hs_ctrl_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "NR", "ctrl", "Human NRvCtrl Distal TUTR Hu Motif Content")
+#metagene_motif(Hu_PWM, cs_prox[names(cs_prox)[names(cs_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], cs_ctrl_prox[names(cs_ctrl_prox)[names(cs_ctrl_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "NR", "ctrl", "Conserved NRvCtrl Proximal TUTR Hu Motif Content")
+#metagene_motif(Hu_PWM, cs_dist[names(cs_dist)[names(cs_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], cs_ctrl_dist[names(cs_ctrl_dist)[names(cs_ctrl_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "NR", "ctrl", "Conserved NRvCtrl Distal TUTR Hu Motif Content")
+
+#ALEs
+metagene_motif(Hu_PWM, mm_prox[names(mm_prox)[names(mm_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_prox[names(mm_ctrl_prox)[names(mm_ctrl_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "NR", "ctrl", "Mouse  Proximal ALE Hu Motif Content")
+metagene_motif(Hu_PWM, mm_dist[names(mm_dist)[names(mm_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], mm_ctrl_dist[names(mm_ctrl_dist)[names(mm_ctrl_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "NR", "ctrl", "Mouse NRvCtrl Distal ALE Hu Motif Content")
+metagene_motif(Hu_PWM, hs_prox[names(hs_prox)[names(hs_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], hs_ctrl_prox[names(hs_ctrl_prox)[names(hs_ctrl_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "NR", "ctrl", "Human NRvCtrl Proximal ALE Hu Motif Content")
+metagene_motif(Hu_PWM, hs_dist[names(hs_dist)[names(hs_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], hs_ctrl_dist[names(hs_ctrl_dist)[names(hs_ctrl_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "NR", "ctrl", "Human NRvCtrl Distal ALE Hu Motif Content")
+#metagene_motif(Hu_PWM, cs_prox[names(cs_prox)[names(cs_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], cs_ctrl_prox[names(cs_ctrl_prox)[names(cs_ctrl_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], "NR", "ctrl", "Conserved NRvCtrl Proximal ALE Hu Motif Content")
+#metagene_motif(Hu_PWM, cs_dist[names(cs_dist)[names(cs_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], cs_ctrl_dist[names(cs_ctrl_dist)[names(cs_ctrl_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], "NR", "ctrl", "Conserved NRvCtrl Distal ALE Hu Motif Content")
+```
+
+```{r, Hu Enrichments across UTR type}
+mm_prox_TUTR_Hu <- motif_compare(Hu_PWM, mm_prox[names(mm_prox)[names(mm_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_prox[names(mm_ctrl_prox)[names(mm_ctrl_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]])
+mm_dist_TUTR_Hu <- motif_compare(Hu_PWM, mm_dist[names(mm_dist)[names(mm_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], mm_ctrl_dist[names(mm_ctrl_dist)[names(mm_ctrl_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]])
+hs_prox_TUTR_Hu <- motif_compare(Hu_PWM, hs_prox[names(hs_prox)[names(hs_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], hs_ctrl_prox[names(hs_ctrl_prox)[names(hs_ctrl_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]])
+hs_dist_TUTR_Hu <- motif_compare(Hu_PWM, hs_dist[names(hs_dist)[names(hs_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], hs_ctrl_dist[names(hs_ctrl_dist)[names(hs_ctrl_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]])
+cs_prox_TUTR_Hu <- motif_compare(Hu_PWM, cs_prox[names(cs_prox)[names(cs_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], cs_ctrl_prox[names(cs_ctrl_prox)[names(cs_ctrl_prox) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]])
+cs_dist_TUTR_Hu <- motif_compare(Hu_PWM, cs_dist[names(cs_dist)[names(cs_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], cs_ctrl_dist[names(cs_ctrl_dist)[names(cs_ctrl_dist) %in% (genetypes %>% filter(genetype == "TUTR") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]])
+
+#ALEs
+mm_prox_ALE_Hu <- motif_compare(Hu_PWM, mm_prox[names(mm_prox)[names(mm_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], mm_ctrl_prox[names(mm_ctrl_prox)[names(mm_ctrl_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]])
+mm_dist_ALE_Hu <- motif_compare(Hu_PWM, mm_dist[names(mm_dist)[names(mm_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], mm_ctrl_dist[names(mm_ctrl_dist)[names(mm_ctrl_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]])
+hs_prox_ALE_Hu <- motif_compare(Hu_PWM, hs_prox[names(hs_prox)[names(hs_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], hs_ctrl_prox[names(hs_ctrl_prox)[names(hs_ctrl_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]])
+hs_dist_ALE_Hu <- motif_compare(Hu_PWM, hs_dist[names(hs_dist)[names(hs_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], hs_ctrl_dist[names(hs_ctrl_dist)[names(hs_ctrl_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]])
+cs_prox_ALE_Hu <- motif_compare(Hu_PWM, cs_prox[names(cs_prox)[names(cs_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]], cs_ctrl_prox[names(cs_ctrl_prox)[names(cs_ctrl_prox) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR0", sep = "_")) %>% pull(name))]])
+cs_dist_ALE_Hu <- motif_compare(Hu_PWM, cs_dist[names(cs_dist)[names(cs_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]], cs_ctrl_dist[names(cs_ctrl_dist)[names(cs_ctrl_dist) %in% (genetypes %>% filter(genetype == "ALE") %>% mutate(name = paste(Gene, "uniqueUTR1", sep = "_")) %>% pull(name))]])
+
+Hu_compare <- list(mm_prox_TUTR_Hu, mm_dist_TUTR_Hu, hs_prox_TUTR_Hu, hs_dist_TUTR_Hu, cs_prox_TUTR_Hu, cs_dist_TUTR_Hu, mm_prox_ALE_Hu, mm_dist_ALE_Hu, hs_prox_ALE_Hu, hs_dist_ALE_Hu, cs_prox_ALE_Hu, cs_dist_ALE_Hu)
+names(Hu_compare) <- c("mm_prox_TUTR", "mm_dist_TUTR", "hs_prox_TUTR", "hs_dist_TUTR", "cs_prox_TUTR", "cs_dist_TUTR", "mm_prox_ALE", "mm_dist_ALE", "hs_prox_ALE", "hs_dist_ALE", "cs_prox_ALE", "cs_dist_ALE")
+Hu_compare <- bind_rows(Hu_compare, .id = "sample") %>% separate(sample, into = c("species", "UTR", "genetype")) %>% separate(motif, into = c("motif", "RBP")) %>% mutate(sig = ifelse(p_adj < 0.05, "< 0.05", "ns"))
+
+Hu_compare %>% filter(UTR == "prox") %>% ggplot(aes(x = log2FC, y = -log(p_adj)), col = sig) + geom_point(aes(col = sig)) + geom_text(data = subset(Hu_compare, sig == "< 0.05"), aes(label = RBP), nudge_y = 1, col = "Red") + facet_wrap(species~genetype, scales = "free_y", nrow = 3) + theme_cowplot() + scale_color_manual(values = c("Red", "Grey")) + labs(title = "Proximal UTRs and Hu Binding Sites")
+
+Hu_compare %>% filter(UTR == "dist") %>% ggplot(aes(x = log2FC, y = -log(p_adj)), col = sig) + geom_point(aes(col = sig)) + geom_text(data = subset(Hu_compare, sig == "< 0.05"), aes(label = RBP), nudge_y = 1, col = "Red") + facet_wrap(species~genetype, scales = "free_y", nrow = 3) + theme_cowplot() + scale_color_manual(values = c("Red", "Grey")) + labs(title = "Distal UTRs and Hu Binding Sites")
+
+```
+
+ELAVL 1, 2, and 3 have small spikes near the beginning of distal TUTRs
+ALEs kind of do the same...
+
+```{r, }
+Hu_PWM %>% ggseqlogo::ggseqlogo(method = "prob") + ggtitle("Hu Protein Motifs being searched for")
+```
+

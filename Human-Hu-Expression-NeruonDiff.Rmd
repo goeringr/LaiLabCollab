@@ -1,0 +1,112 @@
+---
+title: "Human Hu Expression NeuronDiff"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(biomaRt)
+library(tximport)
+library(DESeq2)
+library(cowplot)
+library(ggpubr)
+```
+
+```{r, }
+mart <- useMart("ENSEMBL_MART_ENSEMBL",
+                dataset = "hsapiens_gene_ensembl",
+                host='www.ensembl.org')
+
+
+t2g <- getBM(attributes = c('ensembl_transcript_id',
+                            'ensembl_gene_id',
+                            'external_gene_name',
+                            'refseq_mrna'), mart = mart)
+
+t2g <- dplyr::rename(t2g, "target_id" = ensembl_transcript_id, "ext_gene" = external_gene_name)
+
+ens2gene <- t2g[,c(2,3)]
+colnames(ens2gene)[2] <- 'Gene'
+ens2gene <- unique(ens2gene)
+tx2gene <- t2g[,c(1,2)]
+colnames(tx2gene) <- c('TXNAME', 'GENEID')
+
+
+##create TXI with salmon alignments
+
+files_f <- list.files("psidat/Burke2020/quants2/")
+files_f <- files_f %>% as_tibble() %>% filter(str_detect(value, ".quant.sf")) %>% pull()
+samples_f <- str_sub(files_f, 1, str_length(files_f)-9)
+
+salm_dirs_f <- sapply(samples_f, function(id) file.path(paste("psidat/Burke2020/quants2/",id,".quant.sf",sep = "")))
+
+txi <- tximport(salm_dirs_f, 
+                type = 'salmon', 
+                tx2gene = tx2gene,
+                dropInfReps = TRUE, 
+                countsFromAbundance = 'lengthScaledTPM')
+
+#tpms <- data.frame(txi$abundance) 
+#tpms <- tpms[apply(tpms, MARGIN = 1, function(x) any(x > 5)), ] 
+
+#write.table(tpms, file = "hsNeuronDiff_tpms2.txt")
+tpms <- read.table(file = "hsNeuronDiff_tpms2.txt")
+
+```
+
+
+```{r, }
+conditions <- c("ACC_DORSAL_2","ACC_DORSAL_9","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_6","ACC_DORSAL_9","ACC_DORSAL_9","NEURONS_PLUS_ASTROS_49","NEURONS_PLUS_ASTROS_63","NEURONS_PLUS_ASTROS_77","NPC_15","ROSETTE_21","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_6","ACC_DORSAL_6","ACC_DORSAL_9","ACC_DORSAL_9","NEURONS_ALONE_77","NEURONS_PLUS_ASTROS_49","NEURONS_PLUS_ASTROS_63","NEURONS_PLUS_ASTROS_77","NEURONS_PLUS_ASTROS_77","NPC_15","NPC_15","ROSETTE_21","ACC_DORSAL_2","ACC_DORSAL_6","ACC_DORSAL_9","NPC_15","ROSETTE_21","ROSETTE_21","ACC_DORSAL_2","ACC_DORSAL_6","ACC_DORSAL_9","NEURONS_PLUS_ASTROS_49","NEURONS_PLUS_ASTROS_63","NEURONS_PLUS_ASTROS_77","NPC_15","ROSETTE_21","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_6","ACC_DORSAL_6","ACC_DORSAL_9","NEURONS_PLUS_ASTROS_49","NEURONS_PLUS_ASTROS_63","NEURONS_PLUS_ASTROS_77","NEURONS_PLUS_ASTROS_77","NPC_15","NPC_15","ROSETTE_21","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_6","ACC_DORSAL_9","NEURONS_ALONE_77","NEURONS_PLUS_ASTROS_49","NEURONS_PLUS_ASTROS_63","NEURONS_PLUS_ASTROS_77","NPC_15","ROSETTE_21","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_6","ACC_DORSAL_6","ACC_DORSAL_9","ACC_DORSAL_9","NEURONS_ALONE_77","NEURONS_PLUS_ASTROS_49","NEURONS_PLUS_ASTROS_63","NEURONS_PLUS_ASTROS_77","NEURONS_PLUS_ASTROS_77","NPC_15","NPC_15","NPC_15","NPC_15","NPC_15","NPC_15","NPC_15","NPC_15","ROSETTE_21","ACC_DORSAL_2","ACC_DORSAL_6","ACC_DORSAL_9","NEURONS_PLUS_ASTROS_49","NEURONS_PLUS_ASTROS_63","NEURONS_PLUS_ASTROS_77","NPC_15","ROSETTE_21","ROSETTE_21","ACC_DORSAL_2","ACC_DORSAL_6","ACC_DORSAL_6","ACC_DORSAL_6","ACC_DORSAL_6","ACC_DORSAL_6","ACC_DORSAL_6","ACC_DORSAL_6","ACC_DORSAL_9","NEURONS_PLUS_ASTROS_49","NEURONS_PLUS_ASTROS_63","NEURONS_PLUS_ASTROS_77","NPC_15","ROSETTE_21","ROSETTE_21","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_2","ACC_DORSAL_6","ACC_DORSAL_6","ACC_DORSAL_9","ACC_DORSAL_9","NEURONS_ALONE_77","NEURONS_PLUS_ASTROS_49","NEURONS_PLUS_ASTROS_63","NEURONS_PLUS_ASTROS_77","NEURONS_PLUS_ASTROS_77","NPC_15","NPC_15","ROSETTE_21")
+cell_line <- c("X165.B.2","X165.B.2","X165.B.3","X165.B.3","X165.B.3","X165.B.3","X165.B.3","X165.B.3","X165.B.3","X165.B.3","X165.B.3","X165.B.3","X165.B.6X","X165.B.6X","X165.B.6X","X165.B.6X","X165.B.6X","X165.B.6X","X165.B.6X","X165.B.6X","X165.B.6X","X165.B.6X","X165.B.6X","X165.B.6X","X165.B.6X","X165.B.6X","X165.B.6X","X165.B.8X","X165.B.8X","X165.B.8X","X165.B.8X","X165.B.8X","X165.B.8X","X21.B.3","X21.B.3","X21.B.3","X21.B.3","X21.B.3","X21.B.3","X21.B.3","X21.B.3","X21.B.8","X21.B.8","X21.B.8","X21.B.8","X21.B.8","X21.B.8","X21.B.8","X21.B.8","X21.B.8","X21.B.8","X21.B.8","X21.B.8","X21.B.8","X21.B.8","X21.B.9","X21.B.9","X21.B.9","X21.B.9","X21.B.9","X21.B.9","X21.B.9","X21.B.9","X21.B.9","X21.B.9","X21.B.9","X21.B.9","X21.B.9","X21.B.9","X21.B.9","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.3","X66.A.9","X66.A.9","X66.A.9","X66.A.9","X66.A.9","X66.A.9","X66.A.9","X66.A.9","X66.A.9","X90.A.10","X90.A.10","X90.A.10","X90.A.10","X90.A.10","X90.A.10","X90.A.10","X90.A.10","X90.A.10","X90.A.10","X90.A.10","X90.A.10","X90.A.10","X90.A.10","X90.A.10","X90.A.5","X90.A.5","X90.A.5","X90.A.5","X90.A.5","X90.A.5","X90.A.5","X90.A.5","X90.A.5","X90.A.5","X90.A.5","X90.A.5","X90.A.5","X90.A.5","X90.A.5")
+
+colData <- data.frame("sample" = samples_f, "Conditions" = conditions, "cell_line" = cell_line)
+rownames(colData) <- colData$sample
+
+dds <- DESeqDataSetFromTximport(txi, colData = colData, design = ~Conditions + Conditions:cell_line)
+dds <- DESeq(dds)
+norm_counts <- counts(dds, normalized = TRUE)
+#norm_counts <- norm_counts[apply(norm_counts, MARGIN = 1, function(x) all(x > 100)), ]
+write.table(norm_counts, file = "hsNeuronDiff_normcts2.txt")
+norm_counts <- read.table(file = "hsNeuronDiff_normcts2.txt")
+```
+
+```{r, }
+norm_counts %>% 
+  as_tibble(rownames = "ensembl_gene_id") %>% 
+  left_join(., as_tibble(ens2gene)) %>% 
+  dplyr::select(ensembl_gene_id, Gene, everything()) %>%
+  filter(grepl(pattern = "ELAV", Gene)) %>% 
+  filter(Gene != "ELAVL4-AS1") %>% 
+  gather(-ensembl_gene_id, - Gene, key = sample, value = norm_counts) %>% 
+  separate(sample, into = c("cell_ine", "TP"), sep = "_", extra = "merge") %>% 
+  separate(TP, into = c("TP", "rep"), sep = "_rep", fill = "right") %>% 
+  ggplot(aes(x = TP, y = log(norm_counts), col = TP, fill = TP)) + 
+  geom_violin() + 
+  geom_boxplot(col = "Black", position = position_dodge(width = 0.9), width = 0.25) + 
+  geom_point(col = "Black", position = position_jitterdodge()) + 
+  theme_cowplot() + 
+  facet_grid(.~Gene, scales = "free_y") +
+  guides(fill = FALSE, col = FALSE) + 
+  scale_x_discrete(limits = c("ACC_DORSAL_2", "ACC_DORSAL_6", "ACC_DORSAL_9", "NPC_15", "ROSETTE_21", "NEURONS_PLUS_ASTROS_49", "NEURONS_PLUS_ASTROS_63", "NEURONS_PLUS_ASTROS_77", "NEURONS_ALONE_77")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"),
+        axis.text.x = element_text(angle = -30))
+
+norm_counts %>% 
+  as_tibble(rownames = "ensembl_gene_id") %>% 
+  left_join(., as_tibble(ens2gene)) %>% 
+  dplyr::select(ensembl_gene_id, Gene, everything()) %>%
+  filter(grepl(pattern = "ELAV", Gene)) %>% 
+  filter(Gene != "ELAVL4-AS1") %>% 
+  gather(-ensembl_gene_id, - Gene, key = sample, value = norm_counts) %>% 
+  separate(sample, into = c("cell_line", "TP"), sep = "_", extra = "merge") %>% 
+  separate(TP, into = c("TP", "rep"), sep = "_rep", fill = "right") %>% 
+  filter(TP != "NEURONS_ALONS_77") %>% 
+  ggpubr::ggline(x = "TP", y = "norm_counts", color = "Gene", add = "mean_se", size = 1.5, title = "Hu Expression across timepoints", xlab = "", ylab = "normalized counts") + 
+  scale_x_discrete(limits = c("ACC_DORSAL_2", "ACC_DORSAL_6", "ACC_DORSAL_9", "NPC_15", "ROSETTE_21", "NEURONS_PLUS_ASTROS_49", "NEURONS_PLUS_ASTROS_63", "NEURONS_PLUS_ASTROS_77")) +
+  scale_color_manual(values = c("#fc9867", "#a9dc76", "#78dce8", "#ffd866")) +
+  theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1))
+
+#c("#ffd866", "#cfd0e4")
+```
